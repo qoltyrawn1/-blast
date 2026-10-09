@@ -177,7 +177,7 @@ const SUPABASE_ID = 'default';
 const CLOUD_SAVE_DELAY = 2000; // задержка перед сохранением в облако, мс
 
 const KEY = 'business_finances_v1';
-const FIRST = '2026-10';
+const FIRST = '2026-9';
 const AUTOSAVE_KEY = 'finance_autosave_settings_v1';
 
 const baseCats = [
@@ -879,14 +879,14 @@ function render(){
   const tc = $('#top-controls');
   if (tc) tc.classList.toggle('hidden', tab==='settings');
   const titles = {
-    dashboard:'Финансовая панель',
+    dashboard:'',
     months:'История месяцев',
     analytics:'Аналитика',
     employees:'Сотрудники',
     settings:'Настройки'
   };
   const subs = {
-    dashboard:'Обзор, графики и управление финансами',
+    dashboard:'',
     months:'Сравнение периодов и налоговых резервов',
     analytics:'Динамика финансовых результатов',
     employees:'Учёт сотрудников и расчёт фонда оплаты труда',
