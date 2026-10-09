@@ -73,7 +73,7 @@ input[type=month],input[type=date]{color-scheme:dark}
 .cloud-status.saving{background:#3d331a;border-color:#7a662f;color:#f0d777}
 .cloud-status.error{background:#3d1a1a;border-color:#7a2f2f;color:#f0a0a0}
 .cloud-status.offline{background:#2a2a2a;border-color:#555;color:#bbb}
-.cloud-status.waiting{background:#3d331a;border-color:#7a662f;color:#f0d777}
+.cloud-status.dirty{background:#3d2b1a;border-color:#7a512f;color:#f0be77}
 .cloud-status button{background:transparent;border:0;color:inherit;padding:2px 6px;font-size:11px;text-decoration:underline;cursor:pointer}
 .split-box{margin-top:18px;background:linear-gradient(125deg,#1a2c46,#162135 64%);border:1px solid #3a4b68;border-radius:17px;padding:22px;min-width:0}
 .split-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:17px}
@@ -167,13 +167,12 @@ input[type=month],input[type=date]{color-scheme:dark}
 <script>
 (()=>{'use strict';
 
-/* ===== НАСТРОЙКИ SUPABASE ===== */
 const SUPABASE_URL = 'https://mfiadeomygsspaytpjcp.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1maWFkZW9teWdzc3BheXRwamNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1NDUwMTcsImV4cCI6MjEwNzEyMTAxN30.trMMeU38RqUYUI4u2wBrpu3iz9kYdfzieN3c3AguG00';
 const SUPABASE_TABLE = 'finance_state';
 const SUPABASE_BACKUP_TABLE = 'finance_state_backups';
 const SUPABASE_ID = 'default';
-const CLOUD_SAVE_DELAY = 2000;
+const CLOUD_SAVE_DELAY = 1500;
 const RETRY_DELAY = 30000;
 const BACKUP_INTERVAL = 24 * 60 * 60 * 1000;
 const BACKUP_KEEP = 30;
@@ -209,7 +208,6 @@ function blank(){
   };
 }
 
-/* ===== ЗАГРУЗКА СОСТОЯНИЯ ===== */
 let state = initial();
 try {
   const saved = localStorage.getItem(KEY);
@@ -217,9 +215,7 @@ try {
     const parsed = JSON.parse(saved);
     if (parsed && parsed.settings && parsed.months) state = parsed;
   }
-} catch (e){
-  console.warn('Не удалось прочитать localStorage, используем пустое состояние', e);
-}
+} catch (e){ console.warn('localStorage read error', e); }
 
 if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion) < 2){
   state.settings.social = 21675;
@@ -320,11 +316,13 @@ function allocationsFor(ms){
 
 /* ===== СОСТОЯНИЕ СИНХРОНИЗАЦИИ ===== */
 const cloudStatusEl = document.getElementById('cloudStatus');
-const cloudTextEl = document.getElementById('cloudText');
-let cloudState = 'idle'; // idle | saving | synced | error | offline | waiting
+let cloudState = 'idle';
 let cloudText = 'Загрузка…';
 let pendingSave = false;
 let pendingCount = 0;
+let lastLocalChangeTs = Number(localStorage.getItem(KEY+'_ts') || 0);
+let lastCloudTs = 0;
+let suppressSave = false;
 
 function renderCloudStatus(){
   if (!cloudStatusEl) return;
@@ -334,13 +332,13 @@ function renderCloudStatus(){
   else if (cloudState==='saving') html = '↻ ' + cloudText;
   else if (cloudState==='error') html = '⚠ ' + cloudText + (pendingCount>0 ? ' ('+pendingCount+')' : '') + ' <button type="button" id="retrySync">Повторить</button>';
   else if (cloudState==='offline') html = '⚡ Офлайн' + (pendingCount>0 ? ' ('+pendingCount+')' : '');
-  else if (cloudState==='waiting') html = '↻ ' + cloudText;
+  else if (cloudState==='dirty') html = '● Есть изменения <button type="button" id="pushFromStatus">Синхронизировать</button>';
   else html = '☁ ' + cloudText;
   cloudStatusEl.innerHTML = html;
-  if (cloudState==='error'){
-    const btn = cloudStatusEl.querySelector('#retrySync');
-    if (btn) btn.onclick = ()=>saveToCloud(true);
-  }
+  const retry = cloudStatusEl.querySelector('#retrySync');
+  if (retry) retry.onclick = ()=>saveToCloud(true);
+  const push = cloudStatusEl.querySelector('#pushFromStatus');
+  if (push) push.onclick = ()=>syncNow();
 }
 function setCloudStatus(kind, text){
   cloudState = kind;
@@ -348,35 +346,28 @@ function setCloudStatus(kind, text){
   renderCloudStatus();
 }
 
-/* ===== SUPABASE ===== */
+/* ===== ЗАГРУЗКА / СОХРАНЕНИЕ ===== */
+async function fetchCloud(){
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${SUPABASE_ID}&select=data,updated_at`, {
+    headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const rows = await r.json();
+  if (!rows.length) return null;
+  return rows[0];
+}
+
 async function loadFromCloud(){
   try {
     setCloudStatus('saving', 'Загрузка…');
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${SUPABASE_ID}&select=data,updated_at`, {
-      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
-    });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const rows = await r.json();
-    if (!rows.length || !rows[0].data || Object.keys(rows[0].data).length === 0){
-      setCloudStatus('saving', 'Первичная загрузка…');
+    const row = await fetchCloud();
+    if (!row || !row.data || Object.keys(row.data).length === 0){
+      // Облако пустое — выгружаем локальное
       await saveToCloud(true);
       return;
     }
-    const cloudData = rows[0].data;
-    state = cloudData;
-    if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
-      state.settings.social = 21675;
-      state.settings.schemaVersion = 2;
-    }
-    state.settings.defaults ??= {};
-    state.settings.shares = validShares(state.settings.shares);
-    for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
-    state.settings.schemaVersion = 5;
-    normalizeEmployees();
-    current = monthList().at(-1) || FIRST;
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e){}
-    render();
-    setCloudStatus('synced', 'Синхронизировано');
+    applyCloudData(row.data, row.updated_at);
+    setCloudStatus('synced', 'Данные из облака');
   } catch (e){
     console.error('loadFromCloud error', e);
     if (!navigator.onLine) setCloudStatus('offline', '');
@@ -384,7 +375,31 @@ async function loadFromCloud(){
   }
 }
 
+function applyCloudData(data, updatedAt){
+  suppressSave = true;
+  state = data;
+  if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
+    state.settings.social = 21675;
+    state.settings.schemaVersion = 2;
+  }
+  state.settings.defaults ??= {};
+  state.settings.shares = validShares(state.settings.shares);
+  for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
+  state.settings.schemaVersion = 5;
+  normalizeEmployees();
+  current = monthList().at(-1) || FIRST;
+  lastCloudTs = updatedAt ? new Date(updatedAt).getTime() : Date.now();
+  lastLocalChangeTs = lastCloudTs;
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+    localStorage.setItem(KEY+'_ts', String(lastLocalChangeTs));
+  } catch(e){}
+  render();
+  suppressSave = false;
+}
+
 async function saveToCloud(force=false){
+  if (suppressSave) return;
   if (pendingSave && !force) return;
   pendingSave = true;
   try {
@@ -401,18 +416,56 @@ async function saveToCloud(force=false){
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     pendingCount = 0;
+    lastLocalChangeTs = Date.now();
+    lastCloudTs = lastLocalChangeTs;
+    localStorage.setItem(KEY+'_ts', String(lastLocalChangeTs));
     setCloudStatus('synced', 'Синхронизировано');
   } catch (e){
     console.error('saveToCloud error', e);
     pendingCount++;
-    if (!navigator.onLine){
-      setCloudStatus('offline', '');
-    } else {
-      setCloudStatus('error', 'Не сохранено');
-    }
+    if (!navigator.onLine) setCloudStatus('offline', '');
+    else setCloudStatus('error', 'Не сохранено');
     setTimeout(()=>saveToCloud(true), RETRY_DELAY);
   } finally {
     pendingSave = false;
+  }
+}
+
+/* ===== Кнопка "Синхронизировать сейчас" =====
+   Логика:
+   1. Спросить у облака updated_at.
+   2. Если в облаке новее, чем у нас — загрузить из облака.
+   3. Если у нас новее — предложить выгрузить.
+   4. Если одинаково — ничего не делать. */
+async function syncNow(){
+  try {
+    setCloudStatus('saving', 'Проверка…');
+    const row = await fetchCloud();
+    if (!row){
+      await saveToCloud(true);
+      return;
+    }
+    const cloudTs = row.updated_at ? new Date(row.updated_at).getTime() : 0;
+    if (cloudTs > lastLocalChangeTs){
+      if (!confirm('В облаке более свежие данные. Загрузить их? Локальные изменения будут потеряны.')){
+        setCloudStatus('dirty', '');
+        return;
+      }
+      applyCloudData(row.data, row.updated_at);
+      setCloudStatus('synced', 'Загружено из облака');
+    } else if (lastLocalChangeTs > cloudTs){
+      if (!confirm('У вас более свежие данные. Выгрузить их в облако?')){
+        setCloudStatus('dirty', '');
+        return;
+      }
+      await saveToCloud(true);
+    } else {
+      setCloudStatus('synced', 'Синхронизировано');
+    }
+  } catch (e){
+    console.error('syncNow error', e);
+    if (!navigator.onLine) setCloudStatus('offline', '');
+    else setCloudStatus('error', 'Ошибка');
   }
 }
 
@@ -424,8 +477,13 @@ function scheduleCloudSave(){
 }
 
 function save(){
+  if (suppressSave) return;
   state.settings.shares = validShares(state.settings.shares);
-  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e){}
+  lastLocalChangeTs = Date.now();
+  try {
+    localStorage.setItem(KEY, JSON.stringify(state));
+    localStorage.setItem(KEY+'_ts', String(lastLocalChangeTs));
+  } catch(e){}
   const brand = document.getElementById('brand');
   if (brand) brand.textContent = state.settings.name || 'Бласт';
   scheduleCloudSave();
@@ -463,16 +521,13 @@ async function cleanupOldBackups(){
     });
     if (!r.ok) return;
     const rows = await r.json();
-    if (!rows.length) return;
     for (const row of rows){
       await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}?id=eq.${row.id}`, {
         method: 'DELETE',
         headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
       });
     }
-  } catch (e){
-    console.warn('cleanupOldBackups error', e);
-  }
+  } catch (e){ console.warn('cleanupOldBackups error', e); }
 }
 
 async function listBackups(){
@@ -497,18 +552,7 @@ async function restoreBackup(id){
     const rows = await r.json();
     if (!rows.length || !rows[0].data) throw new Error('Бэкап пуст');
     if (!confirm('Восстановить данные из этого бэкапа? Текущее состояние будет заменено.')) return false;
-    state = rows[0].data;
-    if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
-      state.settings.social = 21675;
-      state.settings.schemaVersion = 2;
-    }
-    state.settings.defaults ??= {};
-    state.settings.shares = validShares(state.settings.shares);
-    for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
-    state.settings.schemaVersion = 5;
-    normalizeEmployees();
-    current = monthList().at(-1) || FIRST;
-    render();
+    applyCloudData(rows[0].data, new Date().toISOString());
     await saveToCloud(true);
     alert('Восстановлено из бэкапа');
     return true;
@@ -544,8 +588,7 @@ function downloadJSON(){
   const a = document.createElement('a');
   const url = URL.createObjectURL(blob);
   const d = new Date();
-  const name = `finance-autosave-${d.toISOString().slice(0,10)}.json`;
-  a.href = url; a.download = name; a.click();
+  a.href = url; a.download = `finance-autosave-${d.toISOString().slice(0,10)}.json`; a.click();
   setTimeout(()=>URL.revokeObjectURL(url), 1000);
   setAutosaveSettings({lastSaved: Date.now()});
 }
@@ -575,8 +618,9 @@ function period(){
   return ms.filter(m => m.slice(0,4)===current.slice(0,4));
 }
 
-function kpi(title, value, desc, color=''){
-  return `<div class="card"><div class="label">${title}</div><div class="value ${color}">${value}</div><div class="mini muted">${desc}</div></div>`;
+/* ===== ВИДЖЕТЫ ===== */
+function kpi(title, value, desc, color='', id=''){
+  return `<div class="card"${id?` data-kpi="${id}"`:''}><div class="label">${title}</div><div class="value ${color}">${value}</div><div class="mini muted">${desc}</div></div>`;
 }
 function monthOptions(){
   return monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('');
@@ -620,22 +664,21 @@ function distributionPanel(ms, compact=false){
       ${shareColors.map((color,i)=>`<span ${editable?`data-share-track="${i}"`:''} style="width:${parts[i]}%;background:${color}"></span>`).join('')}
     </div>
     ${editable?`<div class="share-controls">
-      <span class="share-validation" id="shareValidation" role="status">Сумма: 100%. Измените доли и сохраните.</span>
+      <span class="share-validation" id="shareValidation" role="status">Сумма: 100%.</span>
       <button class="btn primary" id="saveShares" disabled>Сохранить распределение</button>
-    </div>
-    <p class="hint">Сумма всех долей должна быть ровно 100%. Изменения сохраняются для ${fmt(current)}; следующие месяцы будут создаваться с последними сохранёнными долями.</p>`:''}
-    <div class="split-info">К распределению за ${unique?'месяц':'выбранный период'}: <strong>${moneyShare(a.total)}</strong>. Расчёт долей ведётся отдельно за каждый месяц. При отрицательной прибыли доли за этот месяц равны нулю.${haveLoss?' Есть убыточные месяцы: их убытки не переносятся автоматически на будущие выплаты.':''} Доля клуба — резерв на периферию, ремонт и улучшения, а не дополнительный расход. Суммы округляются до тиына.</div>
+    </div>`:''}
+    <div class="split-info">К распределению за ${unique?'месяц':'выбранный период'}: <strong>${moneyShare(a.total)}</strong>. Расчёт долей ведётся отдельно за каждый месяц. При отрицательной прибыли доли за этот месяц равны нулю.${haveLoss?' Есть убыточные месяцы.':''}</div>
   </div>`;
 }
 
 function calculationPanel(s){
-  return `<div class="calculation">
+  return `<div class="calculation" data-calc>
     <div class="section-head"><h2>Расчёт чистой прибыли</h2><span class="tag">После всех удержаний</span></div>
-    <div class="calc-row"><span>Доходы Kaspi Pay + онлайн + инкассация</span><strong>${money(s.inc)}</strong></div>
-    <div class="calc-row"><span>Операционные расходы (аренда, зарплата и другое)</span><strong>− ${money(s.ops)}</strong></div>
-    <div class="calc-row"><span>Налог ${num(state.settings.tax)}% от общего дохода</span><strong>− ${moneyShare(s.tax)}</strong></div>
-    <div class="calc-row"><span>Социальные отчисления за месяц</span><strong>− ${moneyShare(s.social)}</strong></div>
-    <div class="calc-row final"><span>Чистая прибыль для распределения</span><strong class="${s.profit>=0?'positive':'negative'}">${moneyShare(s.profit)}</strong></div>
+    <div class="calc-row"><span>Доходы Kaspi Pay + онлайн + инкассация</span><strong data-calc-field="inc">${money(s.inc)}</strong></div>
+    <div class="calc-row"><span>Операционные расходы (аренда, зарплата и другое)</span><strong data-calc-field="ops">− ${money(s.ops)}</strong></div>
+    <div class="calc-row"><span>Налог ${num(state.settings.tax)}% от общего дохода</span><strong data-calc-field="tax">− ${moneyShare(s.tax)}</strong></div>
+    <div class="calc-row"><span>Социальные отчисления за месяц</span><strong data-calc-field="social">− ${moneyShare(s.social)}</strong></div>
+    <div class="calc-row final"><span>Чистая прибыль для распределения</span><strong data-calc-field="profit" class="${s.profit>=0?'positive':'negative'}">${moneyShare(s.profit)}</strong></div>
   </div>`;
 }
 
@@ -712,7 +755,6 @@ function analyticsPage(){
         <div class="mini muted">${money(v)}</div>
       `).join('')}
       <div class="total-strip"><span>Всего поступило</span><b>${money(s.inc)}</b></div>
-      <p class="hint" style="margin-top:18px">Налоговый резерв: ${money(s.tax)} (${num(state.settings.tax)}% от доходов).<br>Соцотчисления: ${money(s.social)} за ${ms.length} мес.</p>
     </div>
   </div>
   <div class="grid2">
@@ -743,11 +785,11 @@ function field(k, title, val){
       <button class="payroll-link" type="button" data-tab="employees" ${isDefault?'data-payroll-jump="latest"':''} title="Открыть список сотрудников и зарплат">
         <strong>${money(total)}</strong><span class="go">Сотрудники →</span>
       </button>
-      <small>${isDefault?'Сумма зарплат из последнего месяца — будет скопирована в следующий месяц':'Автоматическая сумма зарплат сотрудников выбранного месяца'}</small>
+      <small>${isDefault?'Сумма зарплат из последнего месяца':'Автоматическая сумма зарплат сотрудников'}</small>
     </div>`;
   }
   return `<div class="field"><label for="f-${k}">${title}</label>
-    <input id="f-${k}" data-input="${k}" type="number" min="0" step="1" inputmode="decimal" value="${num(val)}">
+    <input id="f-${k}" data-input="${k}" type="number" min="0" step="1" inputmode="numeric" value="${num(val)}">
   </div>`;
 }
 
@@ -758,7 +800,7 @@ function employeesPage(){
   const average = staff.length ? total/staff.length : 0;
   const latest = monthList().at(-1);
   return `<div class="section-head">
-    <div><h2>Зарплаты сотрудников</h2><p class="hint">${fmt(current)} · Суммы учитываются в расходах этого месяца и вычитаются из чистой прибыли.</p></div>
+    <div><h2>Зарплаты сотрудников</h2><p class="hint">${fmt(current)} · Суммы учитываются в расходах этого месяца.</p></div>
     <button class="btn primary" id="addEmployee">+ Добавить сотрудника</button>
   </div>
   <div class="employee-grid">
@@ -771,18 +813,17 @@ function employeesPage(){
             <input id="employee-name-${i}" data-employee-name="${i}" value="${esc(e.name)}" maxlength="100" placeholder="Имя или должность" autocomplete="off">
           </div>
           <div class="field salary-field"><label for="employee-salary-${i}">Зарплата за месяц, ₸</label>
-            <input id="employee-salary-${i}" type="number" min="0" step="1" inputmode="decimal" data-employee-salary="${i}" value="${num(e.salary)}">
+            <input id="employee-salary-${i}" type="number" min="0" step="1" inputmode="numeric" data-employee-salary="${i}" value="${num(e.salary)}">
           </div>
-          <button class="btn danger employee-remove" data-remove-employee="${i}" title="Убрать сотрудника из ${fmt(current)}" aria-label="Удалить сотрудника ${esc(e.name)}">×</button>
+          <button class="btn danger employee-remove" data-remove-employee="${i}" title="Убрать сотрудника" aria-label="Удалить">×</button>
         </div>`).join('')}
       </div>` : `<div class="employee-empty">
         <div class="ico">♙</div>
         <strong>Пока нет сотрудников</strong>
-        <span>Добавьте имя сотрудника и сумму его зарплаты за выбранный месяц.</span>
+        <span>Добавьте имя сотрудника и сумму его зарплаты.</span>
         <button class="btn primary" id="addEmployeeEmpty">+ Добавить первого сотрудника</button>
       </div>`}
       <div class="total-strip"><span>Всего зарплат за ${fmt(current)}</span><b data-payroll-total>${money(total)}</b></div>
-      <p class="hint" style="margin-top:13px">Любое изменение имени или суммы сохраняется автоматически. Удаление действует только для выбранного месяца.</p>
     </div>
     <div>
       <div class="card">
@@ -790,18 +831,15 @@ function employeesPage(){
         <div class="employee-total" data-payroll-total>${money(total)}</div>
         <div class="employee-stat"><span class="muted">Сотрудников</span><strong>${staff.length}</strong></div>
         <div class="employee-stat"><span class="muted">Средняя зарплата</span><strong data-payroll-average>${money(average)}</strong></div>
-        <div class="employee-stat"><span class="muted">В составе расходов месяца</span><strong data-payroll-total>${money(total)}</strong></div>
-        <div class="employee-tip"><b>Как связаны данные</b><p class="hint">Общая сумма зарплат автоматически попадает в статью «Зарплаты» месячного отчёта и в аналитику. Редактировать зарплатный фонд отдельно в расходах не нужно.</p></div>
         <div class="controls" style="margin-top:16px">
           <button class="btn" data-tab="dashboard">← Открыть отчёт месяца</button>
           ${current!==latest?'<button class="btn" id="openLatestPayroll">Последний месяц →</button>':''}
         </div>
       </div>
-      <div class="card section"><h2>Зарплаты в следующих месяцах</h2><p class="hint">При создании следующего месяца сотрудник и его зарплата копируются из последнего отчёта. Дальнейшие изменения не затрагивают прошедшие месяцы.</p></div>
     </div>
   </div>
   <div class="card section">
-    <div class="section-head"><h2>История зарплат</h2><span class="tag">По месяцам</span></div>
+    <div class="section-head"><h2>История зарплат</h2></div>
     <div class="table-wrap"><table>
       <thead><tr><th>Месяц</th><th>Сотрудников</th><th>Всего зарплат</th><th></th></tr></thead>
       <tbody>
@@ -813,18 +851,18 @@ function employeesPage(){
 
 function monthEditor(){
   const d = state.months[current], s = stats(current);
-  const monthPicker = `<select id="dashMonthSelect" aria-label="Месяц для обзора">
+  const monthPicker = `<select id="dashMonthSelect" aria-label="Месяц">
     ${monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('')}
   </select>`;
   return `<div class="section-head">
-    <div><h2>Операции за ${fmt(current)}</h2><p class="hint">Введите итоговые суммы за месяц. Изменения сохраняются автоматически.</p></div>
+    <div><h2>Операции за ${fmt(current)}</h2><p class="hint">Изменения сохраняются автоматически.</p></div>
     <div class="controls">${monthPicker}<span class="tag saved" id="status">Сохранено</span></div>
   </div>
   <div class="kpis">
-    ${kpi('Поступления', money(s.inc), 'Все каналы оплаты')}
-    ${kpi('Расходы и удержания', money(s.expense), 'Полная сумма')}
-    ${kpi('Налоговый резерв', money(s.tax), `${num(state.settings.tax)}% от оборота`)}
-    ${kpi('Чистая прибыль', money(s.profit), 'После всех удержаний', s.profit>=0?'positive':'negative')}
+    ${kpi('Поступления', money(s.inc), 'Все каналы оплаты', '', 'inc')}
+    ${kpi('Расходы и удержания', money(s.expense), 'Полная сумма', '', 'expense')}
+    ${kpi('Налоговый резерв', money(s.tax), `${num(state.settings.tax)}% от оборота`, '', 'tax')}
+    ${kpi('Чистая прибыль', money(s.profit), 'После всех удержаний', s.profit>=0?'positive':'negative', 'profit')}
   </div>
   ${calculationPanel(s)}
   ${distributionPanel([current], true)}
@@ -836,18 +874,17 @@ function monthEditor(){
         ${field('online','Онлайн-оплата', d.online)}
         ${field('encashment','Инкассация', d.encashment)}
       </div>
-      <p class="hint" style="margin-top:12px">Указывайте инкассацию как дополнительный доход только в том случае, если эти суммы ещё не включены в Kaspi Pay или онлайн-оплату, чтобы избежать двойного учёта.</p>
+      <p class="hint" style="margin-top:12px">Инкассация — только если суммы ещё не включены в Kaspi Pay или онлайн-оплату.</p>
       <div class="total-strip"><span>Общий доход</span><b id="monthlyIncome">${money(s.inc)}</b></div>
     </div>
     <div class="card">
       <div class="section-head"><h2>Автоматические удержания</h2></div>
       <div class="expense-line"><span>Налоговый резерв (${num(state.settings.tax)}%)</span><strong id="monthlyTax">${money(s.tax)}</strong></div>
       <div class="expense-line"><span>Социальные отчисления / мес.</span><strong>${money(s.social)}</strong></div>
-      <p class="hint">Налог 3% резервируется ежемесячно для полугодовой уплаты; социальные отчисления 21 675 ₸ по умолчанию списываются в каждом месяце. Фактическую сумму можно изменить в настройках.</p>
     </div>
   </div>
   <div class="card section">
-    <div class="section-head"><h2>Расходы за месяц</h2><span class="tag">${baseCats.length} категорий</span></div>
+    <div class="section-head"><h2>Расходы за месяц</h2></div>
     <div class="rows">${baseCats.map(([k,name])=>field(k,name,d[k])).join('')}</div>
     <div class="section-head" style="margin-top:25px">
       <h2>Дополнительные расходы</h2>
@@ -857,10 +894,10 @@ function monthEditor(){
       ${(d.custom||[]).map((c,i)=>`<div class="rows" style="margin-bottom:10px;grid-template-columns:1fr 1fr auto">
         <div class="field"><label>Название</label><input data-custom-name="${i}" value="${esc(c.name)}" maxlength="80"></div>
         <div class="field"><label>Сумма, ₸</label><input type="number" min="0" data-custom-value="${i}" value="${num(c.value)}"></div>
-        <button class="btn danger" data-remove="${i}" aria-label="Удалить статью" style="align-self:end">×</button>
+        <button class="btn danger" data-remove="${i}" aria-label="Удалить" style="align-self:end">×</button>
       </div>`).join('')}
     </div>
-    <div class="total-strip"><span>Итого расходов и удержаний</span><b>${money(s.expense)}</b></div>
+    <div class="total-strip"><span>Итого расходов и удержаний</span><b id="monthlyExpense">${money(s.expense)}</b></div>
   </div>`;
 }
 
@@ -869,7 +906,7 @@ function monthsPage(){
   return `<div class="section-head"><h2>Помесячные отчёты</h2><button class="btn primary" id="addMonths">+ Следующий месяц</button></div>
   <div class="card">
     <div class="table-wrap"><table>
-      <thead><tr><th>Период</th><th>Kaspi Pay</th><th>Онлайн</th><th>Инкассация</th><th>Доход</th><th>Расходы и удержания</th><th>Чистая прибыль</th><th>Жасталап</th><th>Асылхан</th><th>Дамир</th><th>Улучшение клуба</th><th></th></tr></thead>
+      <thead><tr><th>Период</th><th>Kaspi Pay</th><th>Онлайн</th><th>Инкассация</th><th>Доход</th><th>Расходы</th><th>Чистая прибыль</th><th>Жасталап</th><th>Асылхан</th><th>Дамир</th><th>Улучшение</th><th></th></tr></thead>
       <tbody>
         ${ms.map(m=>{const s=stats(m);return `<tr class="clickable" data-open="${m}">
           <td>${fmt(m)}</td>
@@ -887,9 +924,8 @@ function monthsPage(){
   </div>
   <div class="card section">
     <h2>Полугодовые налоговые резервы</h2>
-    <p class="hint">Расчёт накопленного резерва по периодам январь–июнь / июль–декабрь, без учёта ранее перечисленных сумм.</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>Полугодие</th><th>Месяцев с отчётами</th><th>Доходы</th><th>Резерв налога</th></tr></thead>
+      <thead><tr><th>Полугодие</th><th>Месяцев</th><th>Доходы</th><th>Резерв налога</th></tr></thead>
       <tbody>
         ${Object.entries(monthList().reduce((a,m)=>{
           const [y,mo] = m.split('-').map(Number);
@@ -906,26 +942,24 @@ function settingsPage(){
   const s = state.settings;
   const auto = getAutosaveSettings();
   const lastBackup = Number(localStorage.getItem(BACKUP_TS_KEY) || 0);
+  const localStr = lastLocalChangeTs ? new Date(lastLocalChangeTs).toLocaleString('ru-RU') : '—';
+  const cloudStr = lastCloudTs ? new Date(lastCloudTs).toLocaleString('ru-RU') : '—';
   return `<div class="grid2">
     <div class="card">
       <h2>Параметры бизнеса</h2>
-      <p class="hint">Изменение ставки влияет на все сохранённые месяцы.</p>
       <div class="field" style="margin-top:18px"><label>Название бизнеса</label><input id="businessName" maxlength="65" value="${esc(s.name)}"></div>
       <div class="rows" style="margin-top:15px">
         <div class="field"><label>Ставка налогового резерва, %</label><input type="number" min="0" max="100" step="0.01" id="taxRate" value="${num(s.tax)}"></div>
-        <div class="field"><label>Социальные отчисления за месяц, ₸ (по умолчанию 21 675)</label><input type="number" min="0" id="social" value="${num(s.social)}"></div>
+        <div class="field"><label>Социальные отчисления за месяц, ₸</label><input type="number" min="0" id="social" value="${num(s.social)}"></div>
       </div>
-      <p class="hint">Соцотчисления списываются из чистой прибыли ежемесячно, до разделения между участниками. Налог 3% резервируется от всего оборота. Это управленческий расчёт.</p>
     </div>
     <div class="card">
       <h2>Постоянные расходы для новых месяцев</h2>
-      <p class="hint">Значения используются при создании следующего месяца. Для зарплат нажмите «Сотрудники». История расходов не меняется.</p>
       <div class="rows" style="margin-top:17px">${baseCats.map(([k,n])=>field('default-'+k,n,s.defaults[k]||0)).join('')}</div>
     </div>
   </div>
   <div class="card section">
     <h2>Распределение для новых месяцев</h2>
-    <p class="hint">Измените доли по умолчанию. Существующие месяцы не изменятся; для любого месяца можно отдельно настроить доли в его отчёте.</p>
     <div class="split-grid share-settings">
       ${shareNames.map((name,i)=>`<div class="split-card" style="--share-color:${shareColors[i]}">
         <label class="label" for="defaultShare${i}">${name}</label>
@@ -933,26 +967,28 @@ function settingsPage(){
       </div>`).join('')}
     </div>
     <div class="share-controls">
-      <span class="share-validation" id="defaultShareValidation" role="status">Сумма: 100%. Измените доли и сохраните.</span>
-      <button class="btn primary" id="saveDefaultShares" disabled>Сохранить значения для новых месяцев</button>
+      <span class="share-validation" id="defaultShareValidation" role="status">Сумма: 100%.</span>
+      <button class="btn primary" id="saveDefaultShares" disabled>Сохранить</button>
     </div>
   </div>
   <div class="card section">
-    <h2>Облачная синхронизация (Supabase)</h2>
-    <p class="hint">Данные автоматически сохраняются в облако и подтягиваются на всех устройствах.</p>
+    <h2>Синхронизация с облаком</h2>
+    <p class="hint">Кнопка <b>«Синхронизировать»</b> сначала проверяет, что в облаке — если там новее, загрузит; если у вас новее — спросит, выгружать ли.</p>
     <div class="cloud-box">
-      <h3>Состояние: <span id="cloudStateText">${cloudState}</span></h3>
+      <p class="hint">Локальные изменения: <b>${localStr}</b></p>
+      <p class="hint">Облако: <b>${cloudStr}</b></p>
+      <p class="hint">Текущее состояние: <b>${cloudState}</b></p>
       <div class="controls">
-        <button class="btn primary" id="syncNow">☁ Синхронизировать сейчас</button>
-        <button class="btn" id="loadCloud">⬇ Загрузить из облака</button>
-        <button class="btn" id="pushCloud">⬆ Выгрузить в облако</button>
+        <button class="btn primary" id="syncNowBtn">☁ Синхронизировать</button>
+        <button class="btn" id="loadCloudBtn">⬇ Загрузить из облака</button>
+        <button class="btn" id="pushCloudBtn">⬆ Выгрузить в облако</button>
       </div>
       <p class="hint" style="margin-top:10px">Проект: <code>mfiadeomygsspaytpjcp</code></p>
     </div>
   </div>
   <div class="card section">
     <h2>Автоматические бэкапы</h2>
-    <p class="hint">Раз в сутки сайт сохраняет снимок данных в облако. Хранятся последние 30 снимков. Из любого можно восстановить состояние.</p>
+    <p class="hint">Раз в сутки сайт сохраняет снимок в облако. Хранятся последние 30 снимков.</p>
     <div class="cloud-box">
       <p class="hint">Последний бэкап: <b>${lastBackup ? new Date(lastBackup).toLocaleString('ru-RU') : 'ещё не создавался'}</b></p>
       <div class="controls">
@@ -960,17 +996,16 @@ function settingsPage(){
         <button class="btn" id="refreshBackups">Обновить список</button>
       </div>
       <div class="backup-list" id="backupList">
-        <p class="hint">Нажмите «Обновить список», чтобы загрузить последние 10 бэкапов.</p>
+        <p class="hint">Нажмите «Обновить список».</p>
       </div>
     </div>
   </div>
   <div class="card section">
     <h2>Автосохранение в файл</h2>
-    <p class="hint">Резервная копия автоматически скачивается в «Файлы» раз в указанное количество дней.</p>
     <div class="cloud-box">
       <label><input type="checkbox" id="autosaveEnabled" ${auto.enabled?'checked':''}> Включить автосохранение</label>
       <div class="field" style="margin-top:10px">
-        <label>Интервал (дней)</label>
+        <label>Интервал</label>
         <select id="autosaveInterval">
           <option value="1" ${auto.intervalDays==1?'selected':''}>Каждый день</option>
           <option value="3" ${auto.intervalDays==3?'selected':''}>Раз в 3 дня</option>
@@ -980,7 +1015,7 @@ function settingsPage(){
       </div>
       <div class="controls">
         <button class="btn primary" id="downloadNow">Скачать копию сейчас</button>
-        <span class="hint" id="lastSavedText">${auto.lastSaved?'Последняя копия: '+new Date(auto.lastSaved).toLocaleDateString('ru-RU'):'Автосохранение ещё не срабатывало'}</span>
+        <span class="hint">${auto.lastSaved?'Последняя копия: '+new Date(auto.lastSaved).toLocaleDateString('ru-RU'):'Ещё не срабатывало'}</span>
       </div>
     </div>
   </div>
@@ -991,52 +1026,82 @@ function settingsPage(){
       <button class="btn" id="exportCsv">Экспорт CSV</button>
       <button class="btn" id="importJson">Импорт JSON</button>
     </div>
-  </div>
-  <div class="card section">
-    <h2>Назначение приложения</h2>
-    <p class="hint">Панель предназначена для управленческого учёта. Это не замена бухгалтерской системе, официальной декларации, расчёту заработной платы и обязательных взносов.</p>
   </div>`;
 }
 
+/* ===== ТОЧЕЧНОЕ ОБНОВЛЕНИЕ ===== */
+/* Обновляет KPI-карточки, расчёт, доли, итоги — без перерисовки полей ввода. */
+function refreshComputed(){
+  const s = stats(current);
+  // KPI-карточки
+  const kpis = document.querySelectorAll('#content [data-kpi]');
+  kpis.forEach(card=>{
+    const key = card.dataset.kpi;
+    const valEl = card.querySelector('.value');
+    if (!valEl) return;
+    const v = key==='inc'?s.inc : key==='expense'?s.expense : key==='tax'?s.tax : key==='profit'?s.profit : null;
+    if (v===null) return;
+    valEl.textContent = money(v);
+    if (key==='profit') valEl.className = 'value ' + (v>=0?'positive':'negative');
+  });
+  // Расчёт
+  const calc = document.querySelector('#content [data-calc]');
+  if (calc){
+    const set = (name,val)=>{const el=calc.querySelector(`[data-calc-field="${name}"]`); if(el) el.innerHTML=val;};
+    set('inc', money(s.inc));
+    set('ops', '− ' + money(s.ops));
+    set('tax', '− ' + moneyShare(s.tax));
+    set('social', '− ' + moneyShare(s.social));
+    const profitEl = calc.querySelector('[data-calc-field="profit"]');
+    if (profitEl){ profitEl.innerHTML = moneyShare(s.profit); profitEl.className = s.profit>=0?'positive':'negative'; }
+  }
+  // Общий доход / итог расходов / налог
+  const mI = document.getElementById('monthlyIncome'); if (mI) mI.textContent = money(s.inc);
+  const mT = document.getElementById('monthlyTax'); if (mT) mT.textContent = money(s.tax);
+  const mE = document.getElementById('monthlyExpense'); if (mE) mE.textContent = money(s.expense);
+  // Суммы долей в блоке распределения
+  const a = allocation(s, current);
+  a.shares.forEach((v,i)=>{
+    const el = document.querySelector(`[data-share-amount="${i}"]`);
+    if (el) el.textContent = moneyShare(v);
+  });
+}
+
+/* ===== РЕНДЕР ===== */
+let isRendering = false;
 function render(){
-  save();
-  const ms = $('#monthSelect');
-  if (ms) ms.innerHTML = monthOptions();
-  const tc = $('#top-controls');
-  if (tc) tc.classList.toggle('hidden', tab==='settings');
+  if (isRendering) return;
+  isRendering = true;
+  try {
+    save();
+    const ms = $('#monthSelect');
+    if (ms) ms.innerHTML = monthOptions();
+    const tc = $('#top-controls');
+    if (tc) tc.classList.toggle('hidden', tab==='settings');
 
-  const titles = {
-    dashboard:'Финансовая панель',
-    months:'История месяцев',
-    analytics:'Аналитика по периодам',
-    employees:'Сотрудники',
-    settings:'Настройки'
-  };
-  const subs = {
-    dashboard:'Операции, расходы и прибыль',
-    months:'Сравнение периодов и налоговых резервов',
-    analytics:'Динамика финансовых результатов',
-    employees:'Учёт сотрудников и расчёт фонда оплаты труда',
-    settings:'Параметры учёта и синхронизация'
-  };
+    const titles = { dashboard:'Финансовая панель', months:'История месяцев', analytics:'Аналитика по периодам', employees:'Сотрудники', settings:'Настройки' };
+    const subs = { dashboard:'Операции, расходы и прибыль', months:'Сравнение периодов', analytics:'Динамика финансовых результатов', employees:'Учёт сотрудников', settings:'Параметры учёта и синхронизация' };
 
-  const topBar = document.getElementById('topBar');
-  const showTop = (tab === 'analytics' || tab === 'months' || tab === 'employees');
-  if (topBar) topBar.style.display = showTop ? '' : 'none';
+    const topBar = document.getElementById('topBar');
+    const showTop = (tab === 'analytics' || tab === 'months' || tab === 'employees');
+    if (topBar) topBar.style.display = showTop ? '' : 'none';
 
-  const pt = $('#page-title'), ps = $('#page-sub');
-  if (pt) pt.textContent = titles[tab];
-  if (ps) ps.textContent = subs[tab];
+    const pt = $('#page-title'), ps = $('#page-sub');
+    if (pt) pt.textContent = titles[tab];
+    if (ps) ps.textContent = subs[tab];
 
-  $$('[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab===tab));
-  const content = $('#content');
-  if (!content) return;
-  content.innerHTML =
-    tab==='dashboard' ? monthEditor() :
-    tab==='months' ? monthsPage() :
-    tab==='analytics' ? analyticsPage() :
-    tab==='employees' ? employeesPage() :
-    settingsPage();
+    $$('[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab===tab));
+    const content = $('#content');
+    if (!content) return;
+    content.innerHTML =
+      tab==='dashboard' ? monthEditor() :
+      tab==='months' ? monthsPage() :
+      tab==='analytics' ? analyticsPage() :
+      tab==='employees' ? employeesPage() :
+      settingsPage();
+  } finally {
+    isRendering = false;
+  }
 }
 
 function makeNext(){
@@ -1094,18 +1159,9 @@ function previewShares(kind){
   label.textContent =
     !vals?.every(Number.isFinite) ? 'Введите все четыре процента.' :
     !vals.every(v=>v>=0&&v<=100) ? 'Каждая доля должна быть от 0% до 100%.' :
-    !vals.every(v=>Math.round(v*100)===v*100) ? 'Максимум два знака после запятой.' :
-    'Сумма: '+showPct(sum)+(valid?' — готово к сохранению.':' — необходимо ровно 100%.');
+    !vals.every(v=>Math.round(v*100)===v*100) ? 'Максимум два знака.' :
+    'Сумма: '+showPct(sum)+(valid?' — готово.':' — нужно ровно 100%.');
   btn.disabled = !valid;
-  if (monthly && vals?.every(Number.isFinite)){
-    const total = Math.max(0, stats(current).profit);
-    vals.forEach((v,i)=>{
-      const el = document.querySelector(`[data-share-amount="${i}"]`);
-      const span = document.querySelector(`[data-share-track="${i}"]`);
-      if (el) el.textContent = moneyShare(total * Math.max(0,v)/100);
-      if (span) span.style.width = Math.max(0,Math.min(100,v))+'%';
-    });
-  }
 }
 
 async function refreshBackupList(){
@@ -1113,10 +1169,7 @@ async function refreshBackupList(){
   if (!listEl) return;
   listEl.innerHTML = '<p class="hint">Загрузка…</p>';
   const rows = await listBackups();
-  if (!rows.length){
-    listEl.innerHTML = '<p class="hint">Бэкапов пока нет.</p>';
-    return;
-  }
+  if (!rows.length){ listEl.innerHTML = '<p class="hint">Бэкапов пока нет.</p>'; return; }
   listEl.innerHTML = rows.map(r=>`
     <div class="backup-item">
       <span class="time">${new Date(r.created_at).toLocaleString('ru-RU')}</span>
@@ -1127,14 +1180,12 @@ async function refreshBackupList(){
   `).join('');
 }
 
+/* ===== СОБЫТИЯ ===== */
 document.addEventListener('click', async e => {
   const b = e.target.closest('button,[data-open],[data-employee-open]');
   if (!b) return;
 
-  if (b.dataset.restoreBackup){
-    await restoreBackup(b.dataset.restoreBackup);
-    return;
-  }
+  if (b.dataset.restoreBackup){ await restoreBackup(b.dataset.restoreBackup); return; }
 
   if (b.dataset.tab){
     if (b.dataset.payrollJump==='latest') current = monthList().at(-1)||FIRST;
@@ -1152,9 +1203,7 @@ document.addEventListener('click', async e => {
   else if (b.dataset.removeEmployee!==undefined){
     const i = Number(b.dataset.removeEmployee);
     const staff = state.months[current].employees;
-    if (staff[i] && confirm('Убрать «'+staff[i].name+'» из зарплат за '+fmt(current)+'?')){
-      staff.splice(i,1); syncPayroll(current); render();
-    }
+    if (staff[i] && confirm('Убрать «'+staff[i].name+'»?')){ staff.splice(i,1); syncPayroll(current); render(); }
   }
   else if (b.id==='addExpense'){ (state.months[current].custom ??= []).push({name:'Новый расход', value:0}); render(); }
   else if (b.dataset.remove!==undefined){ state.months[current].custom.splice(Number(b.dataset.remove),1); render(); }
@@ -1170,9 +1219,9 @@ document.addEventListener('click', async e => {
   else if (b.id==='exportJson') fileDownload(JSON.stringify(state,null,2), 'finance-backup-'+new Date().toISOString().slice(0,10)+'.json', 'application/json');
   else if (b.id==='exportCsv') fileDownload(csv(), 'finance-report.csv', 'text/csv;charset=utf-8');
   else if (b.id==='importJson') $('#importFile').click();
-  else if (b.id==='syncNow'){ await saveToCloud(true); }
-  else if (b.id==='loadCloud'){ if (confirm('Загрузить данные из облака? Локальные изменения будут перезаписаны.')) await loadFromCloud(); }
-  else if (b.id==='pushCloud'){ if (confirm('Выгрузить локальные данные в облако?')) await saveToCloud(true); }
+  else if (b.id==='syncNowBtn') await syncNow();
+  else if (b.id==='loadCloudBtn'){ if (confirm('Загрузить данные из облака? Локальные изменения будут потеряны.')) await loadFromCloud(); }
+  else if (b.id==='pushCloudBtn'){ if (confirm('Выгрузить локальные данные в облако?')) await saveToCloud(true); }
   else if (b.id==='downloadNow') downloadJSON();
   else if (b.id==='makeBackupNow'){ await makeBackup(false); render(); }
   else if (b.id==='refreshBackups'){ await refreshBackupList(); }
@@ -1185,13 +1234,15 @@ document.addEventListener('change', e => {
   else if (t.id==='period'){ range = t.value; render(); }
   else if (t.id==='start'){ start = t.value; render(); }
   else if (t.id==='end'){ end = t.value; render(); }
-  else if (t.id==='businessName'){ state.settings.name = t.value.trim() || 'Бласт'; render(); }
-  else if (t.id==='taxRate'){ state.settings.tax = Math.min(100, num(t.value)); render(); }
-  else if (t.id==='social'){ state.settings.social = num(t.value); render(); }
-  else if (t.id==='autosaveEnabled'){ setAutosaveSettings({enabled: t.checked}); render(); }
-  else if (t.id==='autosaveInterval'){ setAutosaveSettings({intervalDays: Number(t.value)}); render(); }
+  else if (t.id==='businessName'){ state.settings.name = t.value.trim() || 'Бласт'; save(); }
+  else if (t.id==='taxRate'){ state.settings.tax = Math.min(100, num(t.value)); save(); refreshComputed(); }
+  else if (t.id==='social'){ state.settings.social = num(t.value); save(); refreshComputed(); }
+  else if (t.id==='autosaveEnabled'){ setAutosaveSettings({enabled: t.checked}); }
+  else if (t.id==='autosaveInterval'){ setAutosaveSettings({intervalDays: Number(t.value)}); }
 });
 
+/* ГЛАВНОЕ: ввод больше не перерисовывает форму.
+   Обновляем только цифры точечно. */
 document.addEventListener('input', e => {
   const t = e.target;
   if (t.dataset.share!==undefined){ previewShares('month'); return; }
@@ -1211,6 +1262,7 @@ document.addEventListener('input', e => {
       save();
       document.querySelectorAll('[data-payroll-total]').forEach(el=>el.textContent = money(payrollTotal(current)));
       document.querySelectorAll('[data-payroll-average]').forEach(el=>el.textContent = money(payrollTotal(current)/Math.max(1, state.months[current].employees.length)));
+      refreshComputed();
     }
     return;
   }
@@ -1219,52 +1271,21 @@ document.addEventListener('input', e => {
     if (k.startsWith('default-')) state.settings.defaults[k.replace('default-','')] = num(t.value);
     else state.months[current][k] = num(t.value);
     save();
-    if (tab==='dashboard'){
-      const st = stats(current);
-      const cards = [...$('#content').querySelectorAll('.kpis')].at(-1);
-      if (cards){
-        const v = cards.querySelectorAll('.value');
-        if (v.length===4){
-          v[0].textContent = money(st.inc);
-          v[1].textContent = money(st.expense);
-          v[2].textContent = money(st.tax);
-          v[3].textContent = money(st.profit);
-        }
-      }
-      const mI = $('#monthlyIncome'), mT = $('#monthlyTax');
-      if (mI) mI.textContent = money(st.inc);
-      if (mT) mT.textContent = money(st.tax);
-      const strips = $('#content').querySelectorAll('.total-strip');
-      if (strips.length) strips[strips.length-1].lastElementChild.textContent = money(st.expense);
-    }
-    clearTimeout(window.__refresh);
-    window.__refresh = setTimeout(()=>{
-      if (document.activeElement !== t) render();
-      else {
-        const sel = t.selectionStart;
-        render();
-        const nt = document.querySelector(`[data-input="${k}"]`);
-        if (nt){ nt.focus(); try { nt.setSelectionRange(sel,sel); } catch(e){} }
-      }
-    }, 450);
+    if (tab==='dashboard') refreshComputed();
+    return;
   }
   else if (t.dataset.customValue!==undefined){
     const i = +t.dataset.customValue;
     state.months[current].custom[i].value = num(t.value);
     save();
-    clearTimeout(window.__refresh);
-    window.__refresh = setTimeout(()=>{ render(); const nt = document.querySelector(`[data-custom-value="${i}"]`); if (nt) nt.focus(); }, 450);
+    if (tab==='dashboard') refreshComputed();
+    return;
   }
   else if (t.dataset.customName!==undefined){
     const i = +t.dataset.customName;
     state.months[current].custom[i].name = t.value;
     save();
-    clearTimeout(window.__refresh);
-    window.__refresh = setTimeout(()=>{
-      render();
-      const nt = document.querySelector(`[data-custom-name="${i}"]`);
-      if (nt){ nt.focus(); nt.setSelectionRange(t.selectionStart??nt.value.length, t.selectionStart??nt.value.length); }
-    }, 550);
+    return;
   }
 });
 
@@ -1274,23 +1295,12 @@ $('#importFile').addEventListener('change', async e => {
   try {
     const v = JSON.parse(await f.text());
     if (!v.settings || !v.months || typeof v.months!=='object' || !Object.keys(v.months).length) throw Error('Неверная структура');
-    if (!confirm('Заменить все текущие данные данными из файла?')) return;
-    state = v;
-    if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
-      state.settings.social = 21675;
-      state.settings.schemaVersion = 2;
-    }
-    state.settings.defaults ??= {};
-    state.settings.shares = validShares(state.settings.shares);
-    for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
-    state.settings.schemaVersion = 5;
-    normalizeEmployees();
-    current = monthList().at(-1) || FIRST;
-    render();
+    if (!confirm('Заменить все текущие данные?')) return;
+    applyCloudData(v, new Date().toISOString());
     await saveToCloud(true);
     alert('Данные восстановлены');
   } catch (err){
-    alert('Не удалось импортировать файл: '+err.message);
+    alert('Не удалось импортировать: '+err.message);
   } finally {
     e.target.value = '';
   }
@@ -1305,11 +1315,7 @@ setInterval(checkAutoBackup, 60*60*1000);
 (async function init(){
   render();
   renderCloudStatus();
-  try {
-    await loadFromCloud();
-  } catch (e){
-    console.error('init loadFromCloud error', e);
-  }
+  try { await loadFromCloud(); } catch(e){ console.error('init error', e); }
   checkAutosave();
   checkAutoBackup();
   document.addEventListener('visibilitychange', ()=>{
