@@ -167,3 +167,505 @@ input[type=month],input[type=date]{color-scheme:dark}
 </div>
 <input type="file" id="importFile" accept=".json,application/json" hidden>
 <script>
+(()=>{'use strict';
+
+/* ===== НАСТРОЙКИ SUPABASE ===== */
+const SUPABASE_URL = 'https://mfiadeomygsspaytpjcp.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1maWFkZW9teWdzc3BheXRwamNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1NDUwMTcsImV4cCI6MjEwNzEyMTAxN30.trMMeU38RqUYUI4u2wBrpu3iz9kYdfzieN3c3AguG00';
+const SUPABASE_TABLE = 'finance_state';
+const SUPABASE_ID = 'default';
+const CLOUD_SAVE_DELAY = 2000; // задержка перед сохранением в облако, мс
+
+const KEY = 'business_finances_v1';
+const FIRST = '2026-10';
+const AUTOSAVE_KEY = 'finance_autosave_settings_v1';
+
+const baseCats = [
+  ['rent','Аренда помещения'],
+  ['utilities','Коммунальные услуги'],
+  ['internet','Интернет'],
+  ['payroll','Зарплаты'],
+  ['senet','Подписка SENET'],
+  ['ccboot','Подписка CCBoot'],
+  ['drinks','Закупка напитков'],
+  ['bakery','Закупка выпечки'],
+  ['cleaning','Расходники для уборки']
+];
+
+const initial = () => ({
+  settings: { name:'Бласт', tax:3, social:21675, schemaVersion:5, shares:[25,25,25,25], defaults:{} },
+  months: { [FIRST]: blank() }
+});
+
+function blank(){
+  return {
+    kaspi:0, online:0, encashment:0,
+    custom:[], employees:[],
+    shares:[25,25,25,25],
+    ...Object.fromEntries(baseCats.map(([k])=>[k,0]))
+  };
+}
+
+/* ===== ЗАГРУЗКА СОСТОЯНИЯ ===== */
+let state;
+try {
+  state = JSON.parse(localStorage.getItem(KEY)) || initial();
+  if (!state.settings || !state.months) throw Error('bad');
+} catch { state = initial(); }
+
+if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion) < 2){
+  state.settings.social = 21675;
+  state.settings.schemaVersion = 2;
+}
+state.settings.defaults ??= {};
+state.settings.shares = validShares(state.settings.shares);
+for (const m of Object.values(state.months)) m.shares = validShares(m.shares);
+state.settings.schemaVersion = 5;
+
+let current = Object.keys(state.months).sort().at(-1) || FIRST;
+let tab = 'dashboard', range = 'year', start = FIRST, end = current;
+
+/* ===== УТИЛИТЫ ===== */
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = n => new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0}).format(Math.round(n||0))+' ₸';
+const num = n => Math.max(0, Number(n) || 0);
+const pct = (n,d) => d ? ((n/d)*100).toFixed(1)+'%' : '0%';
+const fmt = m => new Date(m+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'long',year:'numeric'});
+const short = m => new Date(m+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'short',year:'2-digit'});
+const add = (m,n=1) => { const [y,mm]=m.split('-').map(Number); return new Date(Date.UTC(y,mm-1+n,1)).toISOString().slice(0,7); };
+const monthList = () => Object.keys(state.months).filter(m=>m>=FIRST).sort();
+
+const moneyShare = n => new Intl.NumberFormat('ru-RU',{minimumFractionDigits:0,maximumFractionDigits:2}).format(Math.round((n+Number.EPSILON)*100)/100)+' ₸';
+const showPct = n => new Intl.NumberFormat('ru-RU',{maximumFractionDigits:2}).format(n)+'%';
+
+const shareNames = ['Жасталап','Асылхан','Дамир','На улучшение клуба'];
+const shareColors = ['#7393ff','#65dfb5','#ffb978','#b49bff'];
+
+function validShares(v){
+  if (!Array.isArray(v) || v.length !== 4) return [25,25,25,25];
+  const a = v.map(Number);
+  return a.every(x=>Number.isFinite(x)&&x>=0&&x<=100) && Math.abs(a.reduce((x,y)=>x+y,0)-100)<.000001 ? a : [25,25,25,25];
+}
+function sharesOf(m){ return validShares(state.months[m]?.shares ?? state.settings.shares); }
+function payrollTotal(m){ return (state.months[m]?.employees||[]).reduce((a,e)=>a+num(e.salary),0); }
+function syncPayroll(m){ if (state.months[m]) state.months[m].payroll = payrollTotal(m); }
+
+function normalizeEmployees(){
+  for (const [m,d] of Object.entries(state.months)){
+    if (!Array.isArray(d.employees)){
+      const oldPay = num(d.payroll);
+      d.employees = oldPay ? [{id:'imported-'+m, name:'Зарплаты (перенесено)', salary:oldPay}] : [];
+    } else {
+      d.employees = d.employees.filter(e=>e&&typeof e==='object').map((e,i)=>({
+        id: String(e.id||'employee-'+i),
+        name: String(e.name??'Сотрудник'),
+        salary: num(e.salary)
+      }));
+    }
+    syncPayroll(m);
+  }
+}
+normalizeEmployees();
+
+function stats(m){
+  const d = state.months[m] || blank();
+  const inc = num(d.kaspi)+num(d.online)+num(d.encashment);
+  const ops = baseCats.reduce((s,[k])=>s+(k==='payroll'?payrollTotal(m):num(d[k])),0)
+            + (d.custom||[]).reduce((s,c)=>s+num(c.value),0);
+  const tax = inc * num(state.settings.tax) / 100;
+  const social = num(state.settings.social);
+  return {
+    inc, ops, tax, social,
+    expense: ops+tax+social,
+    profit: inc-ops-tax-social,
+    margin: inc ? (inc-ops-tax-social)/inc*100 : 0,
+    kaspi: num(d.kaspi), online: num(d.online), encashment: num(d.encashment)
+  };
+}
+const sum = ms => ms.reduce((a,m)=>{
+  const s = stats(m);
+  Object.keys(a).forEach(k => a[k] += s[k]||0);
+  return a;
+}, {inc:0,ops:0,tax:0,social:0,expense:0,profit:0,kaspi:0,online:0,encashment:0});
+
+function allocation(s,m){
+  const totalCents = Math.max(0, Math.round(s.profit*100));
+  const percents = sharesOf(m);
+  const raw = percents.map(p => totalCents*p/100);
+  const cents = raw.map(Math.floor);
+  const rest = totalCents - cents.reduce((x,y)=>x+y,0);
+  const order = [0,1,2,3].sort((a,b)=>(raw[b]-cents[b])-(raw[a]-cents[a])||a-b);
+  for (let i=0;i<rest;i++) cents[order[i%4]]++;
+  return { distributable: totalCents/100, shares: cents.map(c=>c/100), percents };
+}
+function allocationsFor(ms){
+  const shares = [0,0,0,0];
+  let losses = 0;
+  for (const m of ms){
+    const s = stats(m), a = allocation(s,m);
+    a.shares.forEach((v,i)=>shares[i]+=v);
+    losses += Math.max(0,-s.profit);
+  }
+  return { shares: shares.map(v=>Math.round(v*100)/100), total: Math.round(shares.reduce((a,b)=>a+b,0)*100)/100, losses };
+}
+
+/* ===== SUPABASE ===== */
+const cloudStatusEl = document.getElementById('cloudStatus');
+const cloudTextEl = document.getElementById('cloudText');
+function setCloudStatus(kind, text){
+  cloudStatusEl.className = 'cloud-status ' + kind;
+  cloudTextEl.textContent = text;
+}
+
+async function loadFromCloud(){
+  try {
+    setCloudStatus('saving', 'Загрузка…');
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${SUPABASE_ID}&select=data,updated_at`, {
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`
+      }
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const rows = await r.json();
+    if (!rows.length || !rows[0].data || Object.keys(rows[0].data).length === 0){
+      // В облаке пусто — заливаем текущее состояние
+      setCloudStatus('saving', 'Первичная загрузка…');
+      await saveToCloud(true);
+      return;
+    }
+    const cloudData = rows[0].data;
+    const cloudTime = new Date(rows[0].updated_at).getTime();
+    const localTime = Number(localStorage.getItem(KEY+'_ts') || 0);
+    if (cloudTime >= localTime){
+      // Облако новее — берём его
+      state = cloudData;
+      if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
+        state.settings.social = 21675;
+        state.settings.schemaVersion = 2;
+      }
+      state.settings.defaults ??= {};
+      state.settings.shares = validShares(state.settings.shares);
+      for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
+      state.settings.schemaVersion = 5;
+      normalizeEmployees();
+      current = monthList().at(-1) || FIRST;
+      localStorage.setItem(KEY, JSON.stringify(state));
+      localStorage.setItem(KEY+'_ts', cloudTime);
+      render();
+      setCloudStatus('synced', 'Данные из облака');
+    } else {
+      // Локально новее — заливаем в облако
+      await saveToCloud(true);
+    }
+  } catch (e){
+    console.error('loadFromCloud error', e);
+    setCloudStatus('error', 'Ошибка загрузки');
+  }
+}
+
+let cloudSaveTimer = null;
+async function saveToCloud(force=false){
+  if (cloudSaveTimer){
+    clearTimeout(cloudSaveTimer);
+    cloudSaveTimer = null;
+  }
+  try {
+    setCloudStatus('saving', 'Сохранение…');
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${SUPABASE_ID}`, {
+      method: 'PATCH',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify({ data: state, updated_at: new Date().toISOString() })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    localStorage.setItem(KEY+'_ts', Date.now());
+    setCloudStatus('synced', 'Синхронизировано');
+  } catch (e){
+    console.error('saveToCloud error', e);
+    setCloudStatus('error', 'Ошибка сохранения');
+  }
+}
+
+function scheduleCloudSave(){
+  if (cloudSaveTimer) clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(()=>saveToCloud(true), CLOUD_SAVE_DELAY);
+}
+
+/* ===== СОХРАНЕНИЕ ===== */
+function save(){
+  state.settings.shares = validShares(state.settings.shares);
+  localStorage.setItem(KEY, JSON.stringify(state));
+  localStorage.setItem(KEY+'_ts', Date.now());
+  const brand = document.getElementById('brand');
+  if (brand) brand.textContent = state.settings.name || 'Бласт';
+  scheduleCloudSave();
+}
+
+/* ===== АВТОСОХРАНЕНИЕ В ФАЙЛ ===== */
+const DEFAULT_AUTOSAVE = { enabled:false, intervalDays:3, lastSaved:0 };
+function getAutosaveSettings(){
+  try {
+    const s = JSON.parse(localStorage.getItem(AUTOSAVE_KEY));
+    return Object.assign({}, DEFAULT_AUTOSAVE, s||{});
+  } catch { return {...DEFAULT_AUTOSAVE}; }
+}
+function setAutosaveSettings(patch){
+  const s = Object.assign(getAutosaveSettings(), patch);
+  localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(s));
+  return s;
+}
+function downloadJSON(){
+  const content = JSON.stringify(state, null, 2);
+  const blob = new Blob([content], {type:'application/json'});
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  const d = new Date();
+  const name = `finance-autosave-${d.toISOString().slice(0,10)}.json`;
+  a.href = url; a.download = name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  setAutosaveSettings({lastSaved: Date.now()});
+}
+function checkAutosave(){
+  const s = getAutosaveSettings();
+  if (!s.enabled) return;
+  const elapsedDays = (Date.now() - s.lastSaved) / (1000*60*60*24);
+  if (elapsedDays >= s.intervalDays){
+    downloadJSON();
+  }
+}
+
+/* ===== ПЕРИОДЫ ===== */
+function period(){
+  const ms = monthList();
+  if (range === 'all') return ms;
+  if (range === 'custom') return ms.filter(m => m>=start && m<=end);
+  if (range === 'month') return ms.filter(m => m===current);
+  if (range === 'quarter'){
+    const [y,mo] = current.split('-').map(Number);
+    const q = Math.floor((mo-1)/3);
+    return ms.filter(m => m.slice(0,4)===String(y) && Math.floor((Number(m.slice(5))-1)/3)===q);
+  }
+  if (range === 'half'){
+    const [y,mo] = current.split('-').map(Number);
+    const h = Math.floor((mo-1)/6);
+    return ms.filter(m => m.slice(0,4)===String(y) && Math.floor((Number(m.slice(5))-1)/6)===h);
+  }
+  return ms.filter(m => m.slice(0,4)===current.slice(0,4));
+}
+
+/* ===== ВИДЖЕТЫ ===== */
+function kpi(title, value, desc, color=''){
+  return `<div class="card"><div class="label">${title}</div><div class="value ${color}">${value}</div><div class="mini muted">${desc}</div></div>`;
+}
+function monthOptions(){
+  return monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('');
+}
+function selector(){
+  return `<select id="period" aria-label="Период">
+    <option value="month" ${range==='month'?'selected':''}>Месяц</option>
+    <option value="quarter" ${range==='quarter'?'selected':''}>Квартал</option>
+    <option value="half" ${range==='half'?'selected':''}>Полугодие</option>
+    <option value="year" ${range==='year'?'selected':''}>Год</option>
+    <option value="all" ${range==='all'?'selected':''}>Всё время</option>
+    <option value="custom" ${range==='custom'?'selected':''}>Диапазон</option>
+  </select>
+  ${range==='custom'?`<input type="month" id="start" min="${FIRST}" value="${start}"><input type="month" id="end" min="${FIRST}" value="${end}">`:''}`;
+}
+
+function distributionPanel(ms, compact=false){
+  const a = allocationsFor(ms);
+  const haveLoss = a.losses > 0;
+  const unique = ms.length === 1;
+  const parts = unique ? sharesOf(ms[0]) : (a.total>0 ? a.shares.map(v=>v/a.total*100) : [0,0,0,0]);
+  const editable = compact && unique && ms[0]===current;
+  return `<div class="split-box" ${editable?'id="shareEditor"':''}>
+    <div class="split-head">
+      <div>
+        <h2>${editable?'Настройка долей чистой прибыли':'Распределение чистой прибыли'}</h2>
+        <p class="hint">После расходов, налога ${num(state.settings.tax)}% и социальных отчислений ${money(state.settings.social)} в месяц${editable?' · '+fmt(current):''}</p>
+      </div>
+      <span class="split-tag">${editable?'Редактируемые проценты':unique?parts.map(showPct).join(' / '):'С учётом распределения по месяцам'}</span>
+      ${tab==='dashboard'&&!compact?'<button class="btn" id="editShares">Изменить доли месяца</button>':''}
+    </div>
+    <div class="split-grid">
+      ${shareNames.map((name,i)=>`<div class="split-card" style="--share-color:${shareColors[i]}">
+        <div class="label">${name}</div>
+        ${editable?`<div class="share-input-wrap"><input data-share="${i}" aria-label="Доля ${name}, процентов" type="number" min="0" max="100" step="0.01" inputmode="decimal" value="${parts[i]}"><span>%</span></div>`:''}
+        <div class="split-amount" ${editable?`data-share-amount="${i}"`:''}>${moneyShare(a.shares[i])}</div>
+        <div class="mini muted">${editable?'От чистой прибыли':unique?showPct(parts[i])+' чистой прибыли':(a.total?showPct(parts[i])+' за период':'За выбранный период')}</div>
+      </div>`).join('')}
+    </div>
+    <div class="split-track" role="img" aria-label="Распределение чистой прибыли по долям">
+      ${shareColors.map((color,i)=>`<span ${editable?`data-share-track="${i}"`:''} style="width:${parts[i]}%;background:${color}"></span>`).join('')}
+    </div>
+    ${editable?`<div class="share-controls">
+      <span class="share-validation" id="shareValidation" role="status">Сумма: 100%. Измените доли и сохраните.</span>
+      <button class="btn primary" id="saveShares" disabled>Сохранить распределение</button>
+    </div>
+    <p class="hint">Сумма всех долей должна быть ровно 100%. Изменения сохраняются для ${fmt(current)}; следующие месяцы будут создаваться с последними сохранёнными долями.</p>`:''}
+    <div class="split-info">К распределению за ${unique?'месяц':'выбранный период'}: <strong>${moneyShare(a.total)}</strong>. Расчёт долей ведётся отдельно за каждый месяц. При отрицательной прибыли доли за этот месяц равны нулю.${haveLoss?' Есть убыточные месяцы: их убытки не переносятся автоматически на будущие выплаты.':''} Доля клуба — резерв на периферию, ремонт и улучшения, а не дополнительный расход. Суммы округляются до тиына.</div>
+  </div>`;
+}
+
+function calculationPanel(s){
+  return `<div class="calculation">
+    <div class="section-head"><h2>Расчёт чистой прибыли</h2><span class="tag">После всех удержаний</span></div>
+    <div class="calc-row"><span>Доходы Kaspi Pay + онлайн + инкассация</span><strong>${money(s.inc)}</strong></div>
+    <div class="calc-row"><span>Операционные расходы (аренда, зарплата и другое)</span><strong>− ${money(s.ops)}</strong></div>
+    <div class="calc-row"><span>Налог ${num(state.settings.tax)}% от общего дохода</span><strong>− ${moneyShare(s.tax)}</strong></div>
+    <div class="calc-row"><span>Социальные отчисления за месяц</span><strong>− ${moneyShare(s.social)}</strong></div>
+    <div class="calc-row final"><span>Чистая прибыль для распределения</span><strong class="${s.profit>=0?'positive':'negative'}">${moneyShare(s.profit)}</strong></div>
+  </div>`;
+}
+
+function chart(ms){
+  if (!ms.length) return '<div class="empty">Нет данных за период</div>';
+  const W=700,H=270,left=54,right=12,top=20,bottom=42;
+  const iw=W-left-right, ih=H-top-bottom;
+  const mx = Math.max(1, ...ms.flatMap(m=>{const s=stats(m);return [s.inc,s.profit];}));
+  const mn = Math.min(0, ...ms.map(m=>stats(m).profit));
+  const span = Math.max(1, mx-mn);
+  const x = i => left + (ms.length===1 ? iw/2 : i*iw/(ms.length-1));
+  const y = v => top + (mx-v)/span*ih;
+  const line = k => ms.map((m,i)=>`${i?'L':'M'}${x(i).toFixed(1)} ${y(stats(m)[k]).toFixed(1)}`).join(' ');
+  const ticks = [0,.25,.5,.75,1].map(t=>{
+    const v = mn+(mx-mn)*t, Y = y(v);
+    return `<line x1="${left}" y1="${Y}" x2="${W-right}" y2="${Y}" stroke="#304058" stroke-dasharray="4 6"/><text x="${left-9}" y="${Y+4}" text-anchor="end">${money(v).replace(' ₸','')}</text>`;
+  }).join('');
+  const labels = ms.filter((m,i)=>ms.length<=12||i%Math.ceil(ms.length/12)===0).map(m=>`<text x="${x(ms.indexOf(m))}" y="${H-12}" text-anchor="middle">${short(m)}</text>`).join('');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="График доходов и прибыли">
+    ${ticks}
+    <line x1="${left}" y1="${y(0)}" x2="${W-right}" y2="${y(0)}" stroke="#63738d"/>
+    <path d="${line('inc')}" fill="none" stroke="#7393ff" stroke-width="3" stroke-linejoin="round"/>
+    <path d="${line('profit')}" fill="none" stroke="#65dfb5" stroke-width="3" stroke-linejoin="round"/>
+    ${ms.map((m,i)=>`<circle cx="${x(i)}" cy="${y(stats(m).inc)}" r="4.5" fill="#7393ff"><title>${fmt(m)} · Доход ${money(stats(m).inc)}</title></circle><circle cx="${x(i)}" cy="${y(stats(m).profit)}" r="4.5" fill="#65dfb5"><title>${fmt(m)} · Прибыль ${money(stats(m).profit)}</title></circle>`).join('')}
+    ${labels}
+  </svg>
+  <div class="legend"><span><i class="dot" style="background:#7393ff"></i>Доходы</span><span><i class="dot" style="background:#65dfb5"></i>Чистая прибыль</span></div>`;
+}
+
+function expLines(ms){
+  const rows = baseCats.map(([k,name])=>({
+    name,
+    value: ms.reduce((a,m)=>a+(k==='payroll'?payrollTotal(m):num(state.months[m][k])),0)
+  }));
+  const social = num(state.settings.social)*ms.length;
+  const tax = ms.reduce((a,m)=>a+stats(m).tax,0);
+  rows.push({name:'Социальные отчисления', value:social});
+  rows.push({name:'Резерв налога', value:tax});
+  for (const m of ms){
+    for (const c of state.months[m].custom||[]){
+      const found = rows.find(r=>r.name===c.name);
+      if (found) found.value += num(c.value);
+      else rows.push({name:c.name||'Дополнительный расход', value:num(c.value)});
+    }
+  }
+  return rows.filter(r=>r.value>0).sort((a,b)=>b.value-a.value);
+}
+
+function overview(analytics=false){
+  const ms = period();
+  const s = sum(ms);
+  const periodLabel = ms.length ? `${fmt(ms[0])} — ${fmt(ms.at(-1))}` : 'Нет месяцев';
+  const expenses = expLines(ms);
+  return `<div class="section-head">
+    <div><h2>${analytics?'Аналитика по периодам':'Общие показатели'}</h2><p class="hint">${periodLabel} · ${ms.length} мес.</p></div>
+    <div class="controls">${selector()}</div>
+  </div>
+  <div class="kpis">
+    ${kpi('Общий доход', money(s.inc), 'Kaspi Pay + онлайн + инкассация')}
+    ${kpi('Общие расходы', money(s.expense), 'Включая налог и соцотчисления')}
+    ${kpi('Чистая прибыль', money(s.profit), 'Доход − все расходы', s.profit>=0?'positive':'negative')}
+    ${kpi('Рентабельность', pct(s.profit,s.inc), 'Чистая прибыль / доход')}
+  </div>
+  ${distributionPanel(ms)}
+  <div class="grid2">
+    <div class="card">
+      <div class="section-head"><h2>Динамика доходов и прибыли</h2><span class="tag">По месяцам</span></div>
+      ${chart(ms)}
+    </div>
+    <div class="card">
+      <div class="section-head"><h2>Источники дохода</h2></div>
+      ${[['Kaspi Pay',s.kaspi,'#7292ff'],['Онлайн-оплата',s.online,'#65dfb5'],['Инкассация',s.encashment,'#f6b36a']].map(([n,v,c])=>`
+        <div class="bar-row"><span>${n}</span><div class="track"><div class="fill" style="width:${s.inc?100*v/s.inc:0}%;background:${c}"></div></div><b>${pct(v,s.inc)}</b></div>
+        <div class="mini muted">${money(v)}</div>
+      `).join('')}
+      <div class="total-strip"><span>Всего поступило</span><b>${money(s.inc)}</b></div>
+      <p class="hint" style="margin-top:18px">Налоговый резерв: ${money(s.tax)} (${num(state.settings.tax)}% от доходов).<br>Соцотчисления: ${money(s.social)} за ${ms.length} мес.</p>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <div class="section-head"><h2>Структура расходов</h2></div>
+      ${expenses.length ? expenses.slice(0,10).map((e,i)=>`
+        <div class="bar-row"><span title="${esc(e.name)}">${esc(e.name)}</span><div class="track"><div class="fill" style="width:${100*e.value/(expenses[0].value||1)}%;background:${['#7593fa','#55caa7','#f6b36a','#aa9afa','#e98b9a'][i%5]}"></div></div><b>${money(e.value)}</b></div>
+      `).join('') : '<div class="empty">Пока нет расходов</div>'}
+    </div>
+    <div class="card">
+      <div class="section-head"><h2>Месяцы в периоде</h2></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Месяц</th><th>Доход</th><th>Прибыль</th></tr></thead>
+        <tbody>
+          ${ms.map(m=>`<tr class="clickable" data-open="${m}"><td>${fmt(m)}</td><td>${money(stats(m).inc)}</td><td class="${stats(m).profit>=0?'positive':'negative'}">${money(stats(m).profit)}</td></tr>`).join('') || '<tr><td colspan="3">Нет данных</td></tr>'}
+        </tbody>
+      </table></div>
+    </div>
+  </div>`;
+}
+
+function field(k, title, val){
+  if (k==='payroll' || k==='default-payroll'){
+    const isDefault = k==='default-payroll';
+    const ref = isDefault ? (monthList().at(-1)||FIRST) : current;
+    const total = payrollTotal(ref);
+    return `<div class="field"><label>${title}</label>
+      <button class="payroll-link" type="button" data-tab="employees" ${isDefault?'data-payroll-jump="latest"':''} title="Открыть список сотрудников и зарплат">
+        <strong>${money(total)}</strong><span class="go">Сотрудники →</span>
+      </button>
+      <small>${isDefault?'Сумма зарплат из последнего месяца — будет скопирована в следующий месяц':'Автоматическая сумма зарплат сотрудников выбранного месяца'}</small>
+    </div>`;
+  }
+  return `<div class="field"><label for="f-${k}">${title}</label>
+    <input id="f-${k}" data-input="${k}" type="number" min="0" step="1" inputmode="decimal" value="${num(val)}">
+  </div>`;
+}
+
+function employeesPage(){
+  const d = state.months[current];
+  const staff = d.employees || [];
+  const total = payrollTotal(current);
+  const average = staff.length ? total/staff.length : 0;
+  const latest = monthList().at(-1);
+  return `<div class="section-head">
+    <div><h2>Зарплаты сотрудников</h2><p class="hint">${fmt(current)} · Суммы учитываются в расходах этого месяца и вычитаются из чистой прибыли.</p></div>
+    <button class="btn primary" id="addEmployee">+ Добавить сотрудника</button>
+  </div>
+  <div class="employee-grid">
+    <div class="card">
+      <div class="section-head"><h2>Список сотрудников</h2><span class="tag">${staff.length} чел.</span></div>
+      ${staff.length ? `<div class="employee-list">
+        ${staff.map((e,i)=>`<div class="employee-person">
+          <div class="employee-avatar" aria-hidden="true">${esc((e.name||'С').trim().slice(0,1).toUpperCase()||'С')}</div>
+          <div class="field name-field"><label for="employee-name-${i}">Сотрудник ${i+1}</label>
+            <input id="employee-name-${i}" data-employee-name="${i}" value="${esc(e.name)}" maxlength="100" placeholder="Имя или должность" autocomplete="off">
+          </div>
+          <div class="field salary-field"><label for="employee-salary-${i}">Зарплата за месяц, ₸</label>
+            <input id="employee-salary-${i}" type="number" min="0" step="1" inputmode="decimal" data-employee-salary="${i}" value="${num(e.salary)}">
+          </div>
+          <button class="btn danger employee-remove" data-remove-employee="${i}" title="Убрать сотрудника из ${fmt(current)}" aria-label="Удалить сотрудника ${esc(e.name)}">×</button>
+        </div>`).join('')}
+      </div>` : `<div class="employee-empty">
+        <div class="ico">♙</div>
+        <strong>Пока нет сотрудников</strong>
+        <span>Добавьте имя сотрудника и сумму его зарплаты за выбранный месяц.</span>
+        <button class="btn primary" id="addEmployeeEmpty">+ Добавить первого сотрудника</button>
+      </div>`}
+      <div class="total-strip"><span>Всего зарплат за ${fmt(current)}</span><b data-payroll-total>${money(total)}</b></div>
+      <p class="hint" style="margin-top:13px">Любое изменение имени или суммы сохраняется автоматически. Удаление действует только для вы
