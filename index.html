@@ -196,11 +196,7 @@ function blank(){
   };
 }
 
-let state;
-try {
-  state = JSON.parse(localStorage.getItem(KEY)) || initial();
-  if (!state.settings || !state.months) throw Error('bad');
-} catch { state = initial(); }
+let state = initial();
 
 if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion) < 2){
   state.settings.social = 21675;
@@ -380,8 +376,6 @@ function scheduleCloudSave(){
 
 function save(){
   state.settings.shares = validShares(state.settings.shares);
-  localStorage.setItem(KEY, JSON.stringify(state));
-  localStorage.setItem(KEY+'_ts', Date.now());
   const brand = document.getElementById('brand');
   if (brand) brand.textContent = state.settings.name || 'Бласт';
   scheduleCloudSave();
