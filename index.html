@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Бласт — финансовый учёт</title>
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Финансы">
 <meta name="theme-color" content="#0b1220">
@@ -67,11 +68,13 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:#202f48}
 .saved{color:#6bdbad}.hidden{display:none!important}
 input[type=month],input[type=date]{color-scheme:dark}
 ::selection{background:#5878df}
-.cloud-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:6px 11px;border-radius:50px;border:1px solid #38506e;background:#1d2d48;color:#b9cafa}
+.cloud-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:6px 11px;border-radius:50px;border:1px solid #38506e;background:#1d2d48;color:#b9cafa;transition:all .2s}
 .cloud-status.synced{background:#1a3d33;border-color:#2f7a5e;color:#7fe4bc}
 .cloud-status.saving{background:#3d331a;border-color:#7a662f;color:#f0d777}
 .cloud-status.error{background:#3d1a1a;border-color:#7a2f2f;color:#f0a0a0}
 .cloud-status.offline{background:#2a2a2a;border-color:#555;color:#bbb}
+.cloud-status.waiting{background:#3d331a;border-color:#7a662f;color:#f0d777}
+.cloud-status button{background:transparent;border:0;color:inherit;padding:2px 6px;font-size:11px;text-decoration:underline;cursor:pointer}
 .split-box{margin-top:18px;background:linear-gradient(125deg,#1a2c46,#162135 64%);border:1px solid #3a4b68;border-radius:17px;padding:22px;min-width:0}
 .split-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:17px}
 .split-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
@@ -118,6 +121,11 @@ input[type=month],input[type=date]{color-scheme:dark}
 .cloud-box input[type=checkbox]{width:18px;height:18px;accent-color:#5b77e9}
 .cloud-box input[type=text]{width:100%;font-family:monospace;font-size:12px}
 .cloud-box .field{margin-top:10px}
+.backup-list{display:flex;flex-direction:column;gap:6px;margin-top:12px}
+.backup-item{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:9px 12px;background:#0d1727;border:1px solid #24344e;border-radius:9px;font-size:12px}
+.backup-item .time{color:#96a5bd}
+.backup-item .actions{display:flex;gap:8px}
+.backup-item button{padding:5px 10px;font-size:11px}
 @media(max-width:1060px){.kpis{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
 @media(max-width:650px){.shell{display:block}.side{height:auto;width:auto;position:relative;padding:12px 16px;border-right:0;border-bottom:1px solid #263349}.logo{margin:0 0 10px;font-size:16px}.sidebar-foot{display:none}.nav{flex-direction:row;overflow:auto}.nav button{padding:10px 12px;white-space:nowrap}.main{padding:20px 14px}.top h1{font-size:23px}.kpis,.rows{grid-template-columns:1fr 1fr}.card{padding:15px}.bar-row{grid-template-columns:82px 1fr 82px;gap:8px;font-size:11px}.value{font-size:21px}}
 @media(max-width:410px){.kpis,.rows{grid-template-columns:1fr}}
@@ -163,12 +171,17 @@ input[type=month],input[type=date]{color-scheme:dark}
 const SUPABASE_URL = 'https://mfiadeomygsspaytpjcp.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1maWFkZW9teWdzc3BheXRwamNwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1NDUwMTcsImV4cCI6MjEwNzEyMTAxN30.trMMeU38RqUYUI4u2wBrpu3iz9kYdfzieN3c3AguG00';
 const SUPABASE_TABLE = 'finance_state';
+const SUPABASE_BACKUP_TABLE = 'finance_state_backups';
 const SUPABASE_ID = 'default';
 const CLOUD_SAVE_DELAY = 2000;
+const RETRY_DELAY = 30000;
+const BACKUP_INTERVAL = 24 * 60 * 60 * 1000;
+const BACKUP_KEEP = 30;
 
 const KEY = 'business_finances_v1';
 const FIRST = '2026-09';
 const AUTOSAVE_KEY = 'finance_autosave_settings_v1';
+const BACKUP_TS_KEY = 'finance_last_backup_ts';
 
 const baseCats = [
   ['rent','Аренда помещения'],
@@ -196,7 +209,17 @@ function blank(){
   };
 }
 
+/* ===== ЗАГРУЗКА СОСТОЯНИЯ ===== */
 let state = initial();
+try {
+  const saved = localStorage.getItem(KEY);
+  if (saved){
+    const parsed = JSON.parse(saved);
+    if (parsed && parsed.settings && parsed.months) state = parsed;
+  }
+} catch (e){
+  console.warn('Не удалось прочитать localStorage, используем пустое состояние', e);
+}
 
 if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion) < 2){
   state.settings.social = 21675;
@@ -295,15 +318,37 @@ function allocationsFor(ms){
   return { shares: shares.map(v=>Math.round(v*100)/100), total: Math.round(shares.reduce((a,b)=>a+b,0)*100)/100, losses };
 }
 
-/* ===== SUPABASE ===== */
+/* ===== СОСТОЯНИЕ СИНХРОНИЗАЦИИ ===== */
 const cloudStatusEl = document.getElementById('cloudStatus');
 const cloudTextEl = document.getElementById('cloudText');
-function setCloudStatus(kind, text){
+let cloudState = 'idle'; // idle | saving | synced | error | offline | waiting
+let cloudText = 'Загрузка…';
+let pendingSave = false;
+let pendingCount = 0;
+
+function renderCloudStatus(){
   if (!cloudStatusEl) return;
-  cloudStatusEl.className = 'cloud-status ' + kind;
-  if (cloudTextEl) cloudTextEl.textContent = text;
+  cloudStatusEl.className = 'cloud-status ' + cloudState;
+  let html = '';
+  if (cloudState==='synced') html = '☁ ' + cloudText;
+  else if (cloudState==='saving') html = '↻ ' + cloudText;
+  else if (cloudState==='error') html = '⚠ ' + cloudText + (pendingCount>0 ? ' ('+pendingCount+')' : '') + ' <button type="button" id="retrySync">Повторить</button>';
+  else if (cloudState==='offline') html = '⚡ Офлайн' + (pendingCount>0 ? ' ('+pendingCount+')' : '');
+  else if (cloudState==='waiting') html = '↻ ' + cloudText;
+  else html = '☁ ' + cloudText;
+  cloudStatusEl.innerHTML = html;
+  if (cloudState==='error'){
+    const btn = cloudStatusEl.querySelector('#retrySync');
+    if (btn) btn.onclick = ()=>saveToCloud(true);
+  }
+}
+function setCloudStatus(kind, text){
+  cloudState = kind;
+  if (text) cloudText = text;
+  renderCloudStatus();
 }
 
+/* ===== SUPABASE ===== */
 async function loadFromCloud(){
   try {
     setCloudStatus('saving', 'Загрузка…');
@@ -318,30 +363,30 @@ async function loadFromCloud(){
       return;
     }
     const cloudData = rows[0].data;
-    const cloudTime = new Date(rows[0].updated_at).getTime();
-{
-      state = cloudData;
-if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
-  state.settings.social = 21675;
-  state.settings.schemaVersion = 2;
-}
-state.settings.defaults ??= {};
-state.settings.shares = validShares(state.settings.shares);
-for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
-state.settings.schemaVersion = 5;
-normalizeEmployees();
-current = monthList().at(-1) || FIRST;
-render();
-setCloudStatus('synced', 'Данные из облака');
+    state = cloudData;
+    if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
+      state.settings.social = 21675;
+      state.settings.schemaVersion = 2;
+    }
+    state.settings.defaults ??= {};
+    state.settings.shares = validShares(state.settings.shares);
+    for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
+    state.settings.schemaVersion = 5;
+    normalizeEmployees();
+    current = monthList().at(-1) || FIRST;
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e){}
+    render();
+    setCloudStatus('synced', 'Синхронизировано');
   } catch (e){
     console.error('loadFromCloud error', e);
-    setCloudStatus('error', 'Ошибка загрузки');
+    if (!navigator.onLine) setCloudStatus('offline', '');
+    else setCloudStatus('error', 'Ошибка загрузки');
   }
 }
 
-let cloudSaveTimer = null;
 async function saveToCloud(force=false){
-  if (cloudSaveTimer){ clearTimeout(cloudSaveTimer); cloudSaveTimer = null; }
+  if (pendingSave && !force) return;
+  pendingSave = true;
   try {
     setCloudStatus('saving', 'Сохранение…');
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${SUPABASE_ID}`, {
@@ -355,26 +400,132 @@ async function saveToCloud(force=false){
       body: JSON.stringify({ data: state, updated_at: new Date().toISOString() })
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-setCloudStatus('synced', 'Синхронизировано');
+    pendingCount = 0;
+    setCloudStatus('synced', 'Синхронизировано');
   } catch (e){
     console.error('saveToCloud error', e);
-    setCloudStatus('error', 'Ошибка сохранения');
+    pendingCount++;
+    if (!navigator.onLine){
+      setCloudStatus('offline', '');
+    } else {
+      setCloudStatus('error', 'Не сохранено');
+    }
+    setTimeout(()=>saveToCloud(true), RETRY_DELAY);
+  } finally {
+    pendingSave = false;
   }
 }
 
+let cloudSaveTimer = null;
 function scheduleCloudSave(){
+  pendingCount++;
   if (cloudSaveTimer) clearTimeout(cloudSaveTimer);
   cloudSaveTimer = setTimeout(()=>saveToCloud(true), CLOUD_SAVE_DELAY);
 }
 
 function save(){
   state.settings.shares = validShares(state.settings.shares);
+  try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e){}
   const brand = document.getElementById('brand');
   if (brand) brand.textContent = state.settings.name || 'Бласт';
   scheduleCloudSave();
 }
 
-/* ===== АВТОСОХРАНЕНИЕ ===== */
+/* ===== БЭКАПЫ ===== */
+async function makeBackup(silent=false){
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify({ data: state })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    localStorage.setItem(BACKUP_TS_KEY, String(Date.now()));
+    if (!silent) alert('Бэкап создан');
+    await cleanupOldBackups();
+    return true;
+  } catch (e){
+    console.error('makeBackup error', e);
+    if (!silent) alert('Не удалось создать бэкап: ' + e.message);
+    return false;
+  }
+}
+
+async function cleanupOldBackups(){
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}?select=id&order=created_at.desc&offset=${BACKUP_KEEP}`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    if (!r.ok) return;
+    const rows = await r.json();
+    if (!rows.length) return;
+    for (const row of rows){
+      await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}?id=eq.${row.id}`, {
+        method: 'DELETE',
+        headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+      });
+    }
+  } catch (e){
+    console.warn('cleanupOldBackups error', e);
+  }
+}
+
+async function listBackups(){
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}?select=id,created_at&order=created_at.desc&limit=10`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } catch (e){
+    console.error('listBackups error', e);
+    return [];
+  }
+}
+
+async function restoreBackup(id){
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}?id=eq.${id}&select=data`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const rows = await r.json();
+    if (!rows.length || !rows[0].data) throw new Error('Бэкап пуст');
+    if (!confirm('Восстановить данные из этого бэкапа? Текущее состояние будет заменено.')) return false;
+    state = rows[0].data;
+    if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.settings.schemaVersion)<2){
+      state.settings.social = 21675;
+      state.settings.schemaVersion = 2;
+    }
+    state.settings.defaults ??= {};
+    state.settings.shares = validShares(state.settings.shares);
+    for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
+    state.settings.schemaVersion = 5;
+    normalizeEmployees();
+    current = monthList().at(-1) || FIRST;
+    render();
+    await saveToCloud(true);
+    alert('Восстановлено из бэкапа');
+    return true;
+  } catch (e){
+    console.error('restoreBackup error', e);
+    alert('Не удалось восстановить: ' + e.message);
+    return false;
+  }
+}
+
+async function checkAutoBackup(){
+  const last = Number(localStorage.getItem(BACKUP_TS_KEY) || 0);
+  if (Date.now() - last < BACKUP_INTERVAL) return;
+  await makeBackup(true);
+}
+
+/* ===== АВТОСОХРАНЕНИЕ В ФАЙЛ ===== */
 const DEFAULT_AUTOSAVE = { enabled:false, intervalDays:3, lastSaved:0 };
 function getAutosaveSettings(){
   try {
@@ -405,6 +556,7 @@ function checkAutosave(){
   if (elapsedDays >= s.intervalDays){ downloadJSON(); }
 }
 
+/* ===== ПЕРИОДЫ ===== */
 function period(){
   const ms = monthList();
   if (range === 'all') return ms;
@@ -662,8 +814,8 @@ function employeesPage(){
 function monthEditor(){
   const d = state.months[current], s = stats(current);
   const monthPicker = `<select id="dashMonthSelect" aria-label="Месяц для обзора">
-  ${monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('')}
-</select>`;
+    ${monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('')}
+  </select>`;
   return `<div class="section-head">
     <div><h2>Операции за ${fmt(current)}</h2><p class="hint">Введите итоговые суммы за месяц. Изменения сохраняются автоматически.</p></div>
     <div class="controls">${monthPicker}<span class="tag saved" id="status">Сохранено</span></div>
@@ -753,6 +905,7 @@ function monthsPage(){
 function settingsPage(){
   const s = state.settings;
   const auto = getAutosaveSettings();
+  const lastBackup = Number(localStorage.getItem(BACKUP_TS_KEY) || 0);
   return `<div class="grid2">
     <div class="card">
       <h2>Параметры бизнеса</h2>
@@ -786,20 +939,34 @@ function settingsPage(){
   </div>
   <div class="card section">
     <h2>Облачная синхронизация (Supabase)</h2>
-    <p class="hint">Данные автоматически сохраняются в облако и подтягиваются на всех устройствах, где открыт сайт с этими ключами.</p>
+    <p class="hint">Данные автоматически сохраняются в облако и подтягиваются на всех устройствах.</p>
     <div class="cloud-box">
-      <h3>Состояние: <span id="cloudStateText">—</span></h3>
+      <h3>Состояние: <span id="cloudStateText">${cloudState}</span></h3>
       <div class="controls">
         <button class="btn primary" id="syncNow">☁ Синхронизировать сейчас</button>
         <button class="btn" id="loadCloud">⬇ Загрузить из облака</button>
         <button class="btn" id="pushCloud">⬆ Выгрузить в облако</button>
       </div>
-      <p class="hint" style="margin-top:10px">Ключи уже встроены в приложение. Проект: <code>mfiadeomygsspaytpjcp</code></p>
+      <p class="hint" style="margin-top:10px">Проект: <code>mfiadeomygsspaytpjcp</code></p>
+    </div>
+  </div>
+  <div class="card section">
+    <h2>Автоматические бэкапы</h2>
+    <p class="hint">Раз в сутки сайт сохраняет снимок данных в облако. Хранятся последние 30 снимков. Из любого можно восстановить состояние.</p>
+    <div class="cloud-box">
+      <p class="hint">Последний бэкап: <b>${lastBackup ? new Date(lastBackup).toLocaleString('ru-RU') : 'ещё не создавался'}</b></p>
+      <div class="controls">
+        <button class="btn primary" id="makeBackupNow">Сделать бэкап сейчас</button>
+        <button class="btn" id="refreshBackups">Обновить список</button>
+      </div>
+      <div class="backup-list" id="backupList">
+        <p class="hint">Нажмите «Обновить список», чтобы загрузить последние 10 бэкапов.</p>
+      </div>
     </div>
   </div>
   <div class="card section">
     <h2>Автосохранение в файл</h2>
-    <p class="hint">Резервная копия автоматически скачивается в «Файлы» раз в указанное количество дней. Это страховка от потери данных.</p>
+    <p class="hint">Резервная копия автоматически скачивается в «Файлы» раз в указанное количество дней.</p>
     <div class="cloud-box">
       <label><input type="checkbox" id="autosaveEnabled" ${auto.enabled?'checked':''}> Включить автосохранение</label>
       <div class="field" style="margin-top:10px">
@@ -824,7 +991,6 @@ function settingsPage(){
       <button class="btn" id="exportCsv">Экспорт CSV</button>
       <button class="btn" id="importJson">Импорт JSON</button>
     </div>
-    <p class="hint">JSON сохраняет все настройки и отчёты и подходит для восстановления. CSV можно открывать в Excel.</p>
   </div>
   <div class="card section">
     <h2>Назначение приложения</h2>
@@ -855,8 +1021,7 @@ function render(){
   };
 
   const topBar = document.getElementById('topBar');
-  const topTitle = document.getElementById('topTitle');
-  const showTop = true;
+  const showTop = (tab === 'analytics' || tab === 'months' || tab === 'employees');
   if (topBar) topBar.style.display = showTop ? '' : 'none';
 
   const pt = $('#page-title'), ps = $('#page-sub');
@@ -943,9 +1108,34 @@ function previewShares(kind){
   }
 }
 
-document.addEventListener('click', e => {
+async function refreshBackupList(){
+  const listEl = document.getElementById('backupList');
+  if (!listEl) return;
+  listEl.innerHTML = '<p class="hint">Загрузка…</p>';
+  const rows = await listBackups();
+  if (!rows.length){
+    listEl.innerHTML = '<p class="hint">Бэкапов пока нет.</p>';
+    return;
+  }
+  listEl.innerHTML = rows.map(r=>`
+    <div class="backup-item">
+      <span class="time">${new Date(r.created_at).toLocaleString('ru-RU')}</span>
+      <div class="actions">
+        <button class="btn" data-restore-backup="${r.id}">Восстановить</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+document.addEventListener('click', async e => {
   const b = e.target.closest('button,[data-open],[data-employee-open]');
   if (!b) return;
+
+  if (b.dataset.restoreBackup){
+    await restoreBackup(b.dataset.restoreBackup);
+    return;
+  }
+
   if (b.dataset.tab){
     if (b.dataset.payrollJump==='latest') current = monthList().at(-1)||FIRST;
     tab = b.dataset.tab; render(); window.scrollTo(0,0);
@@ -980,10 +1170,12 @@ document.addEventListener('click', e => {
   else if (b.id==='exportJson') fileDownload(JSON.stringify(state,null,2), 'finance-backup-'+new Date().toISOString().slice(0,10)+'.json', 'application/json');
   else if (b.id==='exportCsv') fileDownload(csv(), 'finance-report.csv', 'text/csv;charset=utf-8');
   else if (b.id==='importJson') $('#importFile').click();
-  else if (b.id==='syncNow'){ saveToCloud(true); }
-  else if (b.id==='loadCloud'){ if (confirm('Загрузить данные из облака? Локальные изменения будут перезаписаны, если облако новее.')) loadFromCloud(); }
-  else if (b.id==='pushCloud'){ if (confirm('Выгрузить локальные данные в облако? Данные в облаке будут перезаписаны.')) saveToCloud(true); }
+  else if (b.id==='syncNow'){ await saveToCloud(true); }
+  else if (b.id==='loadCloud'){ if (confirm('Загрузить данные из облака? Локальные изменения будут перезаписаны.')) await loadFromCloud(); }
+  else if (b.id==='pushCloud'){ if (confirm('Выгрузить локальные данные в облако?')) await saveToCloud(true); }
   else if (b.id==='downloadNow') downloadJSON();
+  else if (b.id==='makeBackupNow'){ await makeBackup(false); render(); }
+  else if (b.id==='refreshBackups'){ await refreshBackupList(); }
 });
 
 document.addEventListener('change', e => {
@@ -1052,7 +1244,7 @@ document.addEventListener('input', e => {
         const sel = t.selectionStart;
         render();
         const nt = document.querySelector(`[data-input="${k}"]`);
-        if (nt){ nt.focus(); try { nt.setSelectionRange(sel,sel); } catch {} }
+        if (nt){ nt.focus(); try { nt.setSelectionRange(sel,sel); } catch(e){} }
       }
     }, 450);
   }
@@ -1095,7 +1287,7 @@ $('#importFile').addEventListener('change', async e => {
     normalizeEmployees();
     current = monthList().at(-1) || FIRST;
     render();
-    saveToCloud(true);
+    await saveToCloud(true);
     alert('Данные восстановлены');
   } catch (err){
     alert('Не удалось импортировать файл: '+err.message);
@@ -1104,14 +1296,24 @@ $('#importFile').addEventListener('change', async e => {
   }
 });
 
+window.addEventListener('online', ()=>{ setCloudStatus('synced','Снова онлайн'); saveToCloud(true); });
+window.addEventListener('offline', ()=>{ setCloudStatus('offline',''); });
+
 setInterval(checkAutosave, 60*60*1000);
+setInterval(checkAutoBackup, 60*60*1000);
 
 (async function init(){
   render();
-  await loadFromCloud();
+  renderCloudStatus();
+  try {
+    await loadFromCloud();
+  } catch (e){
+    console.error('init loadFromCloud error', e);
+  }
   checkAutosave();
+  checkAutoBackup();
   document.addEventListener('visibilitychange', ()=>{
-    if (!document.hidden) loadFromCloud();
+    if (!document.hidden) loadFromCloud().catch(()=>{});
   });
 })();
 
