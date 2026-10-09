@@ -19,7 +19,15 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .shell{display:flex;min-height:100vh}
 .side{width:245px;flex-shrink:0;background:#111b2d;padding:24px 17px;border-right:1px solid #263349;position:sticky;top:0;height:100vh}
 .logo{display:flex;gap:12px;align-items:center;font-size:18px;font-weight:800;margin-bottom:33px}
-.mark{display:grid;place-items:center;background:#5574eb;border-radius:13px;width:41px;height:41px;font-size:23px}
+.mark{display:grid;place-items:center;background:#5574eb;border-radius:13px;width:41px;height:41px;font-size:23px;flex-shrink:0}
+.sync-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border-radius:50%;border:1px solid #38506e;background:#1d2d48;color:#b9cafa;font-size:16px;margin-left:auto;cursor:pointer;transition:all .2s;flex-shrink:0}
+.sync-btn:hover{background:#29436c;border-color:#7799ee;color:#fff}
+.sync-btn.synced{background:#1a3d33;border-color:#2f7a5e;color:#7fe4bc}
+.sync-btn.saving{background:#3d331a;border-color:#7a662f;color:#f0d777;animation:spin 1s linear infinite}
+.sync-btn.error{background:#3d1a1a;border-color:#7a2f2f;color:#f0a0a0}
+.sync-btn.offline{background:#2a2a2a;border-color:#555;color:#bbb}
+.sync-btn.dirty{background:#3d2b1a;border-color:#7a512f;color:#f0be77}
+@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 .muted{color:#96a5bd}.mini{font-size:12px}
 .nav{display:flex;flex-direction:column;gap:6px}
 .nav button{background:transparent;border:0;border-radius:11px;padding:13px 14px;color:#aab9cf;text-align:left}
@@ -139,7 +147,13 @@ input[type=month],input[type=date]{color-scheme:dark}
 <body>
 <div class="shell">
 <aside class="side">
-<div class="logo"><span class="mark">₸</span><span id="brand">Бласт</span></div>
+<div class="logo">
+  <span class="mark">₸</span>
+  <span id="brand">Бласт</span>
+  <button class="sync-btn" id="syncBtn" type="button" title="Синхронизировать">
+    <span id="syncIcon">☁</span>
+  </button>
+</div>
 <nav class="nav" id="nav">
 <button data-tab="dashboard" class="active">◫ &nbsp; Обзор</button>
 <button data-tab="months">▦ &nbsp; Месяцы</button>
@@ -325,6 +339,22 @@ let lastCloudTs = 0;
 let suppressSave = false;
 
 function renderCloudStatus(){
+  const syncBtn = document.getElementById('syncBtn');
+  const syncIcon = document.getElementById('syncIcon');
+  const icons = { idle:'☁', saving:'↻', synced:'✓', error:'⚠', offline:'⚡', dirty:'●' };
+  if (syncBtn){
+    syncBtn.className = 'sync-btn ' + cloudState;
+    syncBtn.title = {
+      idle:'Синхронизация',
+      saving:'Сохранение…',
+      synced:'Синхронизировано',
+      error:'Ошибка — нажмите, чтобы повторить',
+      offline:'Офлайн — нет соединения',
+      dirty:'Есть несинхронизированные изменения'
+    }[cloudState] || 'Синхронизировать';
+  }
+  if (syncIcon) syncIcon.textContent = icons[cloudState] || '☁';
+
   if (!cloudStatusEl) return;
   cloudStatusEl.className = 'cloud-status ' + cloudState;
   let html = '';
@@ -336,7 +366,7 @@ function renderCloudStatus(){
   else html = '☁ ' + cloudText;
   cloudStatusEl.innerHTML = html;
   const retry = cloudStatusEl.querySelector('#retrySync');
-  if (retry) retry.onclick = ()=>saveToCloud(true);
+  if (retry) retry.onclick = ()=>syncNow();
   const push = cloudStatusEl.querySelector('#pushFromStatus');
   if (push) push.onclick = ()=>syncNow();
 }
@@ -346,7 +376,6 @@ function setCloudStatus(kind, text){
   renderCloudStatus();
 }
 
-/* ===== ЗАГРУЗКА / СОХРАНЕНИЕ ===== */
 async function fetchCloud(){
   const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?id=eq.${SUPABASE_ID}&select=data,updated_at`, {
     headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
@@ -362,7 +391,6 @@ async function loadFromCloud(){
     setCloudStatus('saving', 'Загрузка…');
     const row = await fetchCloud();
     if (!row || !row.data || Object.keys(row.data).length === 0){
-      // Облако пустое — выгружаем локальное
       await saveToCloud(true);
       return;
     }
@@ -431,20 +459,11 @@ async function saveToCloud(force=false){
   }
 }
 
-/* ===== Кнопка "Синхронизировать сейчас" =====
-   Логика:
-   1. Спросить у облака updated_at.
-   2. Если в облаке новее, чем у нас — загрузить из облака.
-   3. Если у нас новее — предложить выгрузить.
-   4. Если одинаково — ничего не делать. */
 async function syncNow(){
   try {
     setCloudStatus('saving', 'Проверка…');
     const row = await fetchCloud();
-    if (!row){
-      await saveToCloud(true);
-      return;
-    }
+    if (!row){ await saveToCloud(true); return; }
     const cloudTs = row.updated_at ? new Date(row.updated_at).getTime() : 0;
     if (cloudTs > lastLocalChangeTs){
       if (!confirm('В облаке более свежие данные. Загрузить их? Локальные изменения будут потеряны.')){
@@ -489,7 +508,6 @@ function save(){
   scheduleCloudSave();
 }
 
-/* ===== БЭКАПЫ ===== */
 async function makeBackup(silent=false){
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_BACKUP_TABLE}`, {
@@ -569,7 +587,6 @@ async function checkAutoBackup(){
   await makeBackup(true);
 }
 
-/* ===== АВТОСОХРАНЕНИЕ В ФАЙЛ ===== */
 const DEFAULT_AUTOSAVE = { enabled:false, intervalDays:3, lastSaved:0 };
 function getAutosaveSettings(){
   try {
@@ -599,7 +616,6 @@ function checkAutosave(){
   if (elapsedDays >= s.intervalDays){ downloadJSON(); }
 }
 
-/* ===== ПЕРИОДЫ ===== */
 function period(){
   const ms = monthList();
   if (range === 'all') return ms;
@@ -618,7 +634,6 @@ function period(){
   return ms.filter(m => m.slice(0,4)===current.slice(0,4));
 }
 
-/* ===== ВИДЖЕТЫ ===== */
 function kpi(title, value, desc, color='', id=''){
   return `<div class="card"${id?` data-kpi="${id}"`:''}><div class="label">${title}</div><div class="value ${color}">${value}</div><div class="mini muted">${desc}</div></div>`;
 }
@@ -1029,13 +1044,9 @@ function settingsPage(){
   </div>`;
 }
 
-/* ===== ТОЧЕЧНОЕ ОБНОВЛЕНИЕ ===== */
-/* Обновляет KPI-карточки, расчёт, доли, итоги — без перерисовки полей ввода. */
 function refreshComputed(){
   const s = stats(current);
-  // KPI-карточки
-  const kpis = document.querySelectorAll('#content [data-kpi]');
-  kpis.forEach(card=>{
+  document.querySelectorAll('#content [data-kpi]').forEach(card=>{
     const key = card.dataset.kpi;
     const valEl = card.querySelector('.value');
     if (!valEl) return;
@@ -1044,7 +1055,6 @@ function refreshComputed(){
     valEl.textContent = money(v);
     if (key==='profit') valEl.className = 'value ' + (v>=0?'positive':'negative');
   });
-  // Расчёт
   const calc = document.querySelector('#content [data-calc]');
   if (calc){
     const set = (name,val)=>{const el=calc.querySelector(`[data-calc-field="${name}"]`); if(el) el.innerHTML=val;};
@@ -1055,11 +1065,9 @@ function refreshComputed(){
     const profitEl = calc.querySelector('[data-calc-field="profit"]');
     if (profitEl){ profitEl.innerHTML = moneyShare(s.profit); profitEl.className = s.profit>=0?'positive':'negative'; }
   }
-  // Общий доход / итог расходов / налог
   const mI = document.getElementById('monthlyIncome'); if (mI) mI.textContent = money(s.inc);
   const mT = document.getElementById('monthlyTax'); if (mT) mT.textContent = money(s.tax);
   const mE = document.getElementById('monthlyExpense'); if (mE) mE.textContent = money(s.expense);
-  // Суммы долей в блоке распределения
   const a = allocation(s, current);
   a.shares.forEach((v,i)=>{
     const el = document.querySelector(`[data-share-amount="${i}"]`);
@@ -1067,7 +1075,6 @@ function refreshComputed(){
   });
 }
 
-/* ===== РЕНДЕР ===== */
 let isRendering = false;
 function render(){
   if (isRendering) return;
@@ -1180,7 +1187,6 @@ async function refreshBackupList(){
   `).join('');
 }
 
-/* ===== СОБЫТИЯ ===== */
 document.addEventListener('click', async e => {
   const b = e.target.closest('button,[data-open],[data-employee-open]');
   if (!b) return;
@@ -1220,6 +1226,7 @@ document.addEventListener('click', async e => {
   else if (b.id==='exportCsv') fileDownload(csv(), 'finance-report.csv', 'text/csv;charset=utf-8');
   else if (b.id==='importJson') $('#importFile').click();
   else if (b.id==='syncNowBtn') await syncNow();
+  else if (b.id==='syncBtn') await syncNow();
   else if (b.id==='loadCloudBtn'){ if (confirm('Загрузить данные из облака? Локальные изменения будут потеряны.')) await loadFromCloud(); }
   else if (b.id==='pushCloudBtn'){ if (confirm('Выгрузить локальные данные в облако?')) await saveToCloud(true); }
   else if (b.id==='downloadNow') downloadJSON();
@@ -1241,8 +1248,6 @@ document.addEventListener('change', e => {
   else if (t.id==='autosaveInterval'){ setAutosaveSettings({intervalDays: Number(t.value)}); }
 });
 
-/* ГЛАВНОЕ: ввод больше не перерисовывает форму.
-   Обновляем только цифры точечно. */
 document.addEventListener('input', e => {
   const t = e.target;
   if (t.dataset.share!==undefined){ previewShares('month'); return; }
