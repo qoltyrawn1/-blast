@@ -674,9 +674,12 @@ function employeesPage(){
 
 function monthEditor(){
   const d = state.months[current], s = stats(current);
+  const monthPicker = `<select id="dashMonthSelect" aria-label="Месяц для обзора">
+    ${monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('')}
+  </select>`;
   return `<div class="section-head">
     <div><h2>Операции за ${fmt(current)}</h2><p class="hint">Введите итоговые суммы за месяц. Изменения сохраняются автоматически.</p></div>
-    <span class="tag saved" id="status">Сохранено</span>
+    <div class="controls">${monthPicker}<span class="tag saved" id="status">Сохранено</span></div>
   </div>
   <div class="kpis">
     ${kpi('Поступления', money(s.inc), 'Все каналы оплаты')}
@@ -866,7 +869,7 @@ function render(){
 
   const topBar = document.getElementById('topBar');
   const topTitle = document.getElementById('topTitle');
-  const showTop = (tab === 'analytics' || tab === 'months' || tab === 'employees');
+  const showTop = true;
   if (topBar) topBar.style.display = showTop ? '' : 'none';
 
   const pt = $('#page-title'), ps = $('#page-sub');
@@ -998,7 +1001,7 @@ document.addEventListener('click', e => {
 
 document.addEventListener('change', e => {
   const t = e.target;
-  if (t.id==='monthSelect'){ current = t.value; render(); }
+  else if (t.id==='dashMonthSelect'){ current = t.value; render(); }
   else if (t.id==='period'){ range = t.value; render(); }
   else if (t.id==='start'){ start = t.value; render(); }
   else if (t.id==='end'){ end = t.value; render(); }
