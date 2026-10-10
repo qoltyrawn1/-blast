@@ -133,6 +133,8 @@ input[type=month],input[type=date]{color-scheme:dark}
 .backup-item{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:9px 12px;background:#0d1727;border:1px solid #24344e;border-radius:9px;font-size:12px}
 .backup-item .time{color:#96a5bd}
 .backup-item .actions{display:flex;gap:8px}
+.income-source-list{display:grid;gap:10px;margin-top:16px}.income-source-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;align-items:end;padding:12px;background:#111e31;border:1px solid #30435e;border-radius:12px}.income-source-row .field{min-width:0}.income-source-row input{width:100%}.income-source-add{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end;margin-top:18px}.income-source-add .field input{width:100%}.income-month-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.income-month-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end;padding:11px;background:#111e31;border:1px solid #30435e;border-radius:12px;min-width:0}.income-month-item .field{min-width:0}.income-month-item .field input{width:100%}.income-remove-btn{height:42px;min-width:42px;padding:8px}.copy-report-btn{font-size:12px;padding:7px 10px}.btn.selected{background:#2b4169;border-color:#7898ef;color:#fff}.pie-layout{display:grid;grid-template-columns:minmax(160px,220px) minmax(0,1fr);align-items:center;gap:24px}.pie-chart{width:100%;max-width:220px;aspect-ratio:1;border-radius:50%;margin:auto;border:1px solid #3b4e6b;box-shadow:0 8px 24px #0002}.pie-legend{display:grid;gap:8px;min-width:0}.pie-legend-row{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:9px;align-items:center;font-size:12px;padding:7px 0;border-bottom:1px solid #2b3950}.pie-legend-row .pie-name{color:#afbed4;overflow-wrap:anywhere}.pie-legend-row strong{white-space:nowrap;font-variant-numeric:tabular-nums}.pie-swatch{width:10px;height:10px;border-radius:3px}.pie-total{display:flex;justify-content:space-between;gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid #3a4b65;font-size:13px;font-weight:700}
+@media(max-width:600px){.income-source-row{grid-template-columns:minmax(0,1fr) auto}.income-source-row .tag{grid-column:1}.income-source-row button{grid-column:2;grid-row:1/3}.income-source-add{grid-template-columns:1fr}.income-month-list{grid-template-columns:1fr}.pie-layout{grid-template-columns:1fr}.pie-chart{max-width:190px}}
 .backup-item button{padding:5px 10px;font-size:11px}
 @media(max-width:1060px){.kpis{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
 @media(max-width:650px){.shell{display:block}.side{height:auto;width:auto;position:relative;padding:12px 16px;border-right:0;border-bottom:1px solid #263349}.logo{margin:0 0 10px;font-size:16px}.sidebar-foot{display:none}.nav{flex-direction:row;overflow:auto}.nav button{padding:10px 12px;white-space:nowrap}.main{padding:20px 14px}.top h1{font-size:23px}.kpis,.rows{grid-template-columns:1fr 1fr}.card{padding:15px}.bar-row{grid-template-columns:82px 1fr 82px;gap:8px;font-size:11px}.value{font-size:21px}}
@@ -196,6 +198,12 @@ const FIRST = '2026-09';
 const AUTOSAVE_KEY = 'finance_autosave_settings_v1';
 const BACKUP_TS_KEY = 'finance_last_backup_ts';
 
+const defaultIncomeSources = [
+  {id:'kaspi', name:'Kaspi Pay'},
+  {id:'online', name:'Онлайн-оплата'},
+  {id:'encashment', name:'Инкассация'}
+];
+
 const baseCats = [
   ['rent','Аренда помещения'],
   ['utilities','Коммунальные услуги'],
@@ -209,9 +217,54 @@ const baseCats = [
 ];
 
 const initial = () => ({
-  settings: { name:'Бласт', tax:3, social:21675, schemaVersion:5, shares:[25,25,25,25], defaults:{} },
+  settings: { name:'Бласт', tax:3, social:21675, schemaVersion:5, shares:[25,25,25,25], defaults:{}, incomeSources:defaultIncomeSources.map(s=>({...s})), expenseView:'bars' },
   months: { [FIRST]: blank() }
 });
+
+function cleanIncomeSourceList(list){
+  if (!Array.isArray(list)) return [];
+  const seen = new Set();
+  return list.filter(src=>{
+    if (!src || typeof src!=='object') return false;
+    const id=String(src.id||'');
+    const name=String(src.name||'').trim();
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id) || ['inc','ops','tax','social','expense','profit','margin'].includes(id) || !name || seen.has(id)) return false;
+    seen.add(id); return true;
+  }).map(src=>({id:String(src.id),name:String(src.name).trim().slice(0,80)}));
+}
+function normalizeIncomeSources(){
+  if (!state.settings || typeof state.settings !== 'object') state.settings = {};
+  if (!Array.isArray(state.settings.incomeSources)) state.settings.incomeSources = defaultIncomeSources.map(src=>({...src}));
+  state.settings.incomeSources = cleanIncomeSourceList(state.settings.incomeSources);
+  if (!state.settings.incomeSources.length) state.settings.incomeSources = defaultIncomeSources.map(src=>({...src}));
+  // Migrate older data: each old month inherits the former global source list.
+  for (const d of Object.values(state.months||{})){
+    if (!d || typeof d !== 'object') continue;
+    if (!Array.isArray(d.incomeSources)) d.incomeSources = state.settings.incomeSources.map(src=>({...src}));
+    else d.incomeSources = cleanIncomeSourceList(d.incomeSources);
+    for (const src of d.incomeSources) if (d[src.id] === undefined) d[src.id] = 0;
+  }
+  state.settings.expenseView = state.settings.expenseView === 'pie' ? 'pie' : 'bars';
+}
+function incomeSourcesFor(m){
+  const d=state.months[m];
+  return Array.isArray(d?.incomeSources) ? d.incomeSources : (state.settings.incomeSources||[]);
+}
+function incomeSourceColumns(ms=monthList()){
+  const out=[], seen=new Set();
+  for (const m of ms) for (const src of incomeSourcesFor(m)){
+    const key=src.name.trim().toLocaleLowerCase('ru-RU');
+    if (!seen.has(key)){seen.add(key);out.push({name:src.name,key});}
+  }
+  return out;
+}
+function incomeByName(m,name){
+  const d=state.months[m]||{}; const key=String(name).trim().toLocaleLowerCase('ru-RU');
+  return incomeSourcesFor(m).reduce((total,src)=>total+(src.name.trim().toLocaleLowerCase('ru-RU')===key?num(d[src.id]):0),0);
+}
+function incomeBreakdown(ms){
+  return incomeSourceColumns(ms).map(src=>({name:src.name,value:ms.reduce((total,m)=>total+incomeByName(m,src.name),0)})).filter(src=>src.value>0).sort((a,b)=>b.value-a.value);
+}
 
 function blank(){
   return {
@@ -236,6 +289,7 @@ if (!Number.isFinite(Number(state.settings.schemaVersion)) || Number(state.setti
   state.settings.schemaVersion = 2;
 }
 state.settings.defaults ??= {};
+normalizeIncomeSources();
 state.settings.shares = validShares(state.settings.shares);
 for (const m of Object.values(state.months)) m.shares = validShares(m.shares);
 state.settings.schemaVersion = 5;
@@ -288,7 +342,8 @@ normalizeEmployees();
 
 function stats(m){
   const d = state.months[m] || blank();
-  const inc = num(d.kaspi)+num(d.online)+num(d.encashment);
+  const incomeValues = Object.fromEntries(incomeSourcesFor(m).map(src=>[src.id,num(d[src.id])]));
+  const inc = Object.values(incomeValues).reduce((a,b)=>a+b,0);
   const ops = baseCats.reduce((s,[k])=>s+(k==='payroll'?payrollTotal(m):num(d[k])),0)
             + (d.custom||[]).reduce((s,c)=>s+num(c.value),0);
   const tax = inc * num(state.settings.tax) / 100;
@@ -298,14 +353,14 @@ function stats(m){
     expense: ops+tax+social,
     profit: inc-ops-tax-social,
     margin: inc ? (inc-ops-tax-social)/inc*100 : 0,
-    kaspi: num(d.kaspi), online: num(d.online), encashment: num(d.encashment)
+    ...incomeValues
   };
 }
-const sum = ms => ms.reduce((a,m)=>{
-  const s = stats(m);
-  Object.keys(a).forEach(k => a[k] += s[k]||0);
-  return a;
-}, {inc:0,ops:0,tax:0,social:0,expense:0,profit:0,kaspi:0,online:0,encashment:0});
+const sum = ms => ms.reduce((totals,m)=>{
+  const s=stats(m);
+  for (const key of ['inc','ops','tax','social','expense','profit']) totals[key]+=s[key]||0;
+  return totals;
+},{inc:0,ops:0,tax:0,social:0,expense:0,profit:0});
 
 function allocation(s,m){
   const totalCents = Math.max(0, Math.round(s.profit*100));
@@ -411,6 +466,7 @@ function applyCloudData(data, updatedAt){
     state.settings.schemaVersion = 2;
   }
   state.settings.defaults ??= {};
+  normalizeIncomeSources();
   state.settings.shares = validShares(state.settings.shares);
   for (const d of Object.values(state.months)) d.shares = validShares(d.shares);
   state.settings.schemaVersion = 5;
@@ -689,7 +745,7 @@ function distributionPanel(ms, compact=false){
 function calculationPanel(s){
   return `<div class="calculation" data-calc>
     <div class="section-head"><h2>Расчёт чистой прибыли</h2><span class="tag">После всех удержаний</span></div>
-    <div class="calc-row"><span>Доходы Kaspi Pay + онлайн + инкассация</span><strong data-calc-field="inc">${money(s.inc)}</strong></div>
+    <div class="calc-row"><span>Доходы по всем источникам</span><strong data-calc-field="inc">${money(s.inc)}</strong></div>
     <div class="calc-row"><span>Операционные расходы (аренда, зарплата и другое)</span><strong data-calc-field="ops">− ${money(s.ops)}</strong></div>
     <div class="calc-row"><span>Налог ${num(state.settings.tax)}% от общего дохода</span><strong data-calc-field="tax">− ${moneyShare(s.tax)}</strong></div>
     <div class="calc-row"><span>Социальные отчисления за месяц</span><strong data-calc-field="social">− ${moneyShare(s.social)}</strong></div>
@@ -742,6 +798,17 @@ function expLines(ms){
   return rows.filter(r=>r.value>0).sort((a,b)=>b.value-a.value);
 }
 
+function expensesPie(expenses){
+  if (!expenses.length) return '<div class="empty">Пока нет расходов за выбранный период</div>';
+  const palette = ['#7593fa','#55caa7','#f6b36a','#aa9afa','#e98b9a','#4fc3d8','#d6c65c','#ef8f56','#8196b4','#c17dd8'];
+  const items = expenses.length > 8 ? [...expenses.slice(0,7), {name:'Прочие расходы',value:expenses.slice(7).reduce((a,e)=>a+e.value,0)}] : expenses.slice();
+  const total = items.reduce((a,e)=>a+e.value,0);
+  if (!total) return '<div class="empty">Пока нет расходов за выбранный период</div>';
+  let accumulated = 0;
+  const stops = items.map((item,i)=>{ const start=accumulated; accumulated += item.value/total*100; return `${palette[i%palette.length]} ${start.toFixed(3)}% ${accumulated.toFixed(3)}%`; }).join(', ');
+  return `<div class="pie-layout"><div class="pie-chart" role="img" aria-label="Круговая диаграмма структуры расходов" style="background:conic-gradient(${stops})"></div><div class="pie-legend">${items.map((item,i)=>`<div class="pie-legend-row"><span class="pie-swatch" style="background:${palette[i%palette.length]}"></span><span class="pie-name">${esc(item.name)} <span class="muted">${pct(item.value,total)}</span></span><strong>${money(item.value)}</strong></div>`).join('')}<div class="pie-total"><span>Всего расходов</span><span>${money(total)}</span></div></div></div>`;
+}
+
 function analyticsPage(){
   const ms = period();
   const s = sum(ms);
@@ -752,7 +819,7 @@ function analyticsPage(){
     <div class="controls">${selector()}</div>
   </div>
   <div class="kpis">
-    ${kpi('Общий доход', money(s.inc), 'Kaspi Pay + онлайн + инкассация')}
+    ${kpi('Общий доход', money(s.inc), 'Сумма всех настроенных источников')}
     ${kpi('Общие расходы', money(s.expense), 'Включая налог и соцотчисления')}
     ${kpi('Чистая прибыль', money(s.profit), 'Доход − все расходы', s.profit>=0?'positive':'negative')}
     ${kpi('Рентабельность', pct(s.profit,s.inc), 'Чистая прибыль / доход')}
@@ -765,17 +832,17 @@ function analyticsPage(){
     </div>
     <div class="card">
       <div class="section-head"><h2>Источники дохода</h2></div>
-      ${[['Kaspi Pay',s.kaspi,'#7292ff'],['Онлайн-оплата',s.online,'#65dfb5'],['Инкассация',s.encashment,'#f6b36a']].map(([n,v,c])=>`
-        <div class="bar-row"><span>${n}</span><div class="track"><div class="fill" style="width:${s.inc?100*v/s.inc:0}%;background:${c}"></div></div><b>${pct(v,s.inc)}</b></div>
+      ${incomeBreakdown(ms).map((src,i)=>{const v=src.value; const colors=['#7292ff','#65dfb5','#f6b36a','#b49bff','#e98b9a','#4fc3d8','#d6c65c']; const c=colors[i%colors.length]; return `
+        <div class="bar-row"><span title="${esc(src.name)}">${esc(src.name)}</span><div class="track"><div class="fill" style="width:${s.inc?100*v/s.inc:0}%;background:${c}"></div></div><b>${pct(v,s.inc)}</b></div>
         <div class="mini muted">${money(v)}</div>
-      `).join('')}
+      `;}).join('') || '<div class="empty">Для выбранного периода нет доходов по источникам</div>'}
       <div class="total-strip"><span>Всего поступило</span><b>${money(s.inc)}</b></div>
     </div>
   </div>
   <div class="grid2">
     <div class="card">
-      <div class="section-head"><h2>Структура расходов</h2></div>
-      ${expenses.length ? expenses.slice(0,10).map((e,i)=>`
+      <div class="section-head"><h2>Структура расходов</h2><div class="controls"><button class="btn ${state.settings.expenseView==='bars'?'selected':''}" id="expenseViewBars" aria-pressed="${state.settings.expenseView==='bars'}">Полосы</button><button class="btn ${state.settings.expenseView==='pie'?'selected':''}" id="expenseViewPie" aria-pressed="${state.settings.expenseView==='pie'}">Pie-chart</button></div></div>
+      ${state.settings.expenseView==='pie' ? expensesPie(expenses) : expenses.length ? expenses.slice(0,10).map((e,i)=>`
         <div class="bar-row"><span title="${esc(e.name)}">${esc(e.name)}</span><div class="track"><div class="fill" style="width:${100*e.value/(expenses[0].value||1)}%;background:${['#7593fa','#55caa7','#f6b36a','#aa9afa','#e98b9a'][i%5]}"></div></div><b>${money(e.value)}</b></div>
       `).join('') : '<div class="empty">Пока нет расходов</div>'}
     </div>
@@ -883,13 +950,12 @@ function monthEditor(){
   ${distributionPanel([current], true)}
   <div class="grid2">
     <div class="card">
-      <div class="section-head"><h2>Доходы</h2><span class="tag">3 источника</span></div>
-      <div class="rows">
-        ${field('kaspi','Kaspi Pay', d.kaspi)}
-        ${field('online','Онлайн-оплата', d.online)}
-        ${field('encashment','Инкассация', d.encashment)}
+      <div class="section-head"><h2>Доходы · ${fmt(current)}</h2><span class="tag">Отдельно для этого месяца</span></div>
+      <div class="income-month-list">
+        ${incomeSourcesFor(current).map(src=>`<div class="income-month-item"><div class="field"><label for="income-${esc(src.id)}">${esc(src.name)}</label><input id="income-${esc(src.id)}" data-income-source="${esc(src.id)}" type="number" min="0" step="1" inputmode="numeric" value="${num(d[src.id])}"></div><button class="btn danger income-remove-btn" type="button" data-remove-month-income-source="${esc(src.id)}" aria-label="Убрать ${esc(src.name)} из ${esc(fmt(current))}" title="Убрать только из этого месяца">×</button></div>`).join('') || '<div class="empty">В этом месяце пока нет способов дохода. Добавьте первый ниже.</div>'}
       </div>
-      <p class="hint" style="margin-top:12px">Инкассация — только если суммы ещё не включены в Kaspi Pay или онлайн-оплату.</p>
+      <div class="income-source-add"><div class="field"><label for="newMonthIncomeSourceName">Новый способ дохода для ${fmt(current)}</label><input id="newMonthIncomeSourceName" maxlength="80" placeholder="Например, наличные или аренда ПК"></div><button class="btn primary" type="button" id="addMonthIncomeSource">+ Добавить</button></div>
+      <p class="hint" style="margin-top:12px">Изменения касаются только ${fmt(current)}. В остальных месяцах список источников и суммы не изменятся.</p>
       <div class="total-strip"><span>Общий доход</span><b id="monthlyIncome">${money(s.inc)}</b></div>
     </div>
     <div class="card">
@@ -918,21 +984,19 @@ function monthEditor(){
 
 function monthsPage(){
   const ms = monthList().reverse();
+  const incomeColumns = incomeSourceColumns(monthList());
   return `<div class="section-head"><h2>Помесячные отчёты</h2><button class="btn primary" id="addMonths">+ Следующий месяц</button></div>
   <div class="card">
     <div class="table-wrap"><table>
-      <thead><tr><th>Период</th><th>Kaspi Pay</th><th>Онлайн</th><th>Инкассация</th><th>Доход</th><th>Расходы</th><th>Чистая прибыль</th><th>Жасталап</th><th>Асылхан</th><th>Дамир</th><th>Улучшение</th><th></th></tr></thead>
+      <thead><tr><th>Период</th>${incomeColumns.map(src=>`<th>${esc(src.name)}</th>`).join('')}<th>Доход</th><th>Расходы</th><th>Чистая прибыль</th><th>Жасталап</th><th>Асылхан</th><th>Дамир</th><th>Улучшение</th><th>Отчёт</th></tr></thead>
       <tbody>
         ${ms.map(m=>{const s=stats(m);return `<tr class="clickable" data-open="${m}">
           <td>${fmt(m)}</td>
-          <td>${money(s.kaspi)}</td>
-          <td>${money(s.online)}</td>
-          <td>${money(s.encashment)}</td>
-          <td>${money(s.inc)}</td>
-          <td>${money(s.expense)}</td>
+          ${incomeColumns.map(src=>`<td>${money(incomeByName(m,src.name))}</td>`).join('')}
+          <td>${money(s.inc)}</td><td>${money(s.expense)}</td>
           <td class="${s.profit>=0?'positive':'negative'}">${money(s.profit)}</td>
           ${allocation(s,m).shares.map((v,i)=>`<td><span class="muted mini">${showPct(sharesOf(m)[i])}</span><div>${moneyShare(v)}</div></td>`).join('')}
-          <td>Открыть →</td>
+          <td><button type="button" class="btn copy-report-btn" data-copy-report="${m}">Копировать отчёт</button></td>
         </tr>`;}).join('')}
       </tbody>
     </table></div>
@@ -959,7 +1023,12 @@ function settingsPage(){
   const lastBackup = Number(localStorage.getItem(BACKUP_TS_KEY) || 0);
   const localStr = lastLocalChangeTs ? new Date(lastLocalChangeTs).toLocaleString('ru-RU') : '—';
   const cloudStr = lastCloudTs ? new Date(lastCloudTs).toLocaleString('ru-RU') : '—';
-  return `<div class="grid2">
+  return `<div class="card section">
+    <h2>Способы дохода</h2>
+    <p class="hint">Теперь список способов дохода настраивается отдельно для каждого месяца — во вкладке «Обзор». Выберите нужный месяц и добавьте или уберите источник в блоке «Доходы». Это не повлияет на остальные месяцы.</p>
+    <button class="btn primary" type="button" data-tab="dashboard">Перейти в «Обзор» · ${esc(fmt(current))} →</button>
+  </div>
+  <div class="grid2">
     <div class="card">
       <h2>Параметры бизнеса</h2>
       <div class="field" style="margin-top:18px"><label>Название бизнеса</label><input id="businessName" maxlength="65" value="${esc(s.name)}"></div>
@@ -1116,6 +1185,8 @@ function makeNext(){
   const next = add(last);
   state.months[next] = {
     ...blank(),
+    incomeSources: incomeSourcesFor(last).map(src=>({...src})),
+    ...Object.fromEntries(incomeSourcesFor(last).map(src=>[src.id,0])),
     shares: validShares(state.settings.shares),
     ...Object.fromEntries(baseCats.filter(([k])=>k!=='payroll').map(([k])=>[k, num(state.settings.defaults[k])])),
     employees: (state.months[last].employees||[]).map(e=>({...e}))
@@ -1134,14 +1205,35 @@ function fileDownload(content, name, type){
   setTimeout(()=>URL.revokeObjectURL(url), 1000);
 }
 function csv(){
-  const keys = ['month','kaspi','online','encashment',...baseCats.map(x=>x[0]),'employees','custom','taxReserve','social','totalIncome','totalExpense','netProfit',...['zhastalap','asylkhan','damir','club_improvements'].map(x=>x+'_pct'),...['zhastalap','asylkhan','damir','club_improvements'].map(x=>x+'_amount')];
-  const rows = [keys.join(';')];
+  const incomeColumns = incomeSourceColumns(monthList());
+  const keys = ['month',...incomeColumns.map(src=>src.name),...baseCats.map(x=>x[0]),'employees','custom','taxReserve','social','totalIncome','totalExpense','netProfit',...['zhastalap','asylkhan','damir','club_improvements'].map(x=>x+'_pct'),...['zhastalap','asylkhan','damir','club_improvements'].map(x=>x+'_amount')];
+  const rows = [keys.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(';')];
   for (const m of monthList()){
     const d = state.months[m], s = stats(m);
-    const vals = [m, d.kaspi, d.online, num(d.encashment), ...baseCats.map(([k])=>k==='payroll'?payrollTotal(m):d[k]), (d.employees||[]).map(e=>e.name+': '+e.salary).join(' | '), (d.custom||[]).map(c=>c.name+': '+c.value).join(' | '), s.tax, s.social, s.inc, s.expense, s.profit, ...sharesOf(m), ...allocation(s,m).shares];
+    const vals = [m,...incomeColumns.map(src=>incomeByName(m,src.name)),...baseCats.map(([k])=>k==='payroll'?payrollTotal(m):d[k]), (d.employees||[]).map(e=>e.name+': '+e.salary).join(' | '), (d.custom||[]).map(c=>c.name+': '+c.value).join(' | '), s.tax, s.social, s.inc, s.expense, s.profit, ...sharesOf(m), ...allocation(s,m).shares];
     rows.push(vals.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(';'));
   }
   return '\ufeff'+rows.join('\r\n');
+}
+
+function monthlyReportText(m){
+  const d = state.months[m] || blank(); const s = stats(m);
+  const lines = [
+    `ОТЧЁТ ЗА ${fmt(m).toLocaleUpperCase('ru-RU')}`, '', 'ДОХОДЫ',
+    ...incomeSourcesFor(m).map(src=>`• ${src.name}: ${money(d[src.id]||0)}`), `Итого доходов: ${money(s.inc)}`, '', 'ОПЕРАЦИОННЫЕ РАСХОДЫ',
+    ...baseCats.filter(([k])=>k!=='payroll').map(([k,name])=>({name,value:num(d[k])})).filter(x=>x.value>0).map(x=>`• ${x.name}: ${money(x.value)}`),
+    ...(payrollTotal(m)>0 ? [`• Зарплаты (${(d.employees||[]).length} сотрудников): ${money(payrollTotal(m))}`, ...(d.employees||[]).filter(e=>num(e.salary)>0).map(e=>`  – ${e.name}: ${money(e.salary)}`)] : []),
+    ...(d.custom||[]).filter(c=>num(c.value)>0).map(c=>`• ${c.name||'Дополнительный расход'}: ${money(c.value)}`), `Операционные расходы: ${money(s.ops)}`, '', 'НАЛОГИ И УДЕРЖАНИЯ',
+    `• Резерв налога (${num(state.settings.tax)}%): ${moneyShare(s.tax)}`, `• Социальные отчисления: ${moneyShare(s.social)}`, `Итого расходы и удержания: ${moneyShare(s.expense)}`, '', `ЧИСТАЯ ПРИБЫЛЬ: ${moneyShare(s.profit)}`, '', 'РАСПРЕДЕЛЕНИЕ ЧИСТОЙ ПРИБЫЛИ',
+    ...shareNames.map((name,i)=>`• ${name} (${showPct(sharesOf(m)[i])}): ${moneyShare(allocation(s,m).shares[i])}`)
+  ]; return lines.join('\n');
+}
+
+async function copyMonthlyReport(m, button){
+  const text=monthlyReportText(m);
+  try { if(navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text); else throw new Error('clipboard unavailable'); }
+  catch { const area=document.createElement('textarea'); area.value=text; area.setAttribute('readonly',''); area.style.position='fixed'; area.style.opacity='0'; area.style.pointerEvents='none'; document.body.appendChild(area); area.select(); const ok=document.execCommand('copy'); area.remove(); if(!ok){alert('Не удалось скопировать отчёт. Откройте сайт через HTTPS и попробуйте снова.');return;} }
+  if(button){const old=button.textContent;button.textContent='Скопировано ✓';button.classList.add('selected');setTimeout(()=>{if(button.isConnected){button.textContent=old;button.classList.remove('selected');}},1800);}
 }
 
 function shareEditorValues(selector){
@@ -1192,6 +1284,7 @@ document.addEventListener('click', async e => {
   if (!b) return;
 
   if (b.dataset.restoreBackup){ await restoreBackup(b.dataset.restoreBackup); return; }
+  if (b.dataset.copyReport){ await copyMonthlyReport(b.dataset.copyReport,b); return; }
 
   if (b.dataset.tab){
     if (b.dataset.payrollJump==='latest') current = monthList().at(-1)||FIRST;
@@ -1212,6 +1305,21 @@ document.addEventListener('click', async e => {
     if (staff[i] && confirm('Убрать «'+staff[i].name+'»?')){ staff.splice(i,1); syncPayroll(current); render(); }
   }
   else if (b.id==='addExpense'){ (state.months[current].custom ??= []).push({name:'Новый расход', value:0}); render(); }
+  else if (b.id==='addMonthIncomeSource'){
+    const d=state.months[current]; const input=document.getElementById('newMonthIncomeSourceName'); const name=(input?.value||'').trim().slice(0,80);
+    if(!name){alert('Введите название способа дохода.');input?.focus();return;}
+    if(incomeSourcesFor(current).some(src=>src.name.toLocaleLowerCase('ru-RU')===name.toLocaleLowerCase('ru-RU'))){alert('В этом месяце такой способ уже есть.');input?.focus();return;}
+    const usedIds=new Set(Object.values(state.months).flatMap(month=>(month.incomeSources||[]).map(src=>src.id)));
+    let id='income_'+Date.now().toString(36);while(usedIds.has(id))id+='_x';
+    (d.incomeSources??=[]).push({id,name});d[id]=0;save();render();document.getElementById('income-'+id)?.focus();
+  }
+  else if (b.dataset.removeMonthIncomeSource!==undefined){
+    const id=b.dataset.removeMonthIncomeSource;const d=state.months[current];const src=incomeSourcesFor(current).find(item=>item.id===id);if(!src)return;
+    const affected=num(d[id]);
+    if(!confirm(`Убрать способ «${src.name}» только из ${fmt(current)}? Сумма ${money(affected)} за этот месяц перестанет учитываться в доходах. Остальные месяцы не изменятся.`))return;
+    d.incomeSources=d.incomeSources.filter(item=>item.id!==id);delete d[id];save();render();
+  }
+  else if (b.id==='expenseViewBars' || b.id==='expenseViewPie'){state.settings.expenseView=b.id==='expenseViewPie'?'pie':'bars';save();render();}
   else if (b.dataset.remove!==undefined){ state.months[current].custom.splice(Number(b.dataset.remove),1); render(); }
   else if (b.id==='editShares'){ document.getElementById('shareEditor')?.scrollIntoView({behavior:'smooth', block:'start'}); }
   else if (b.id==='saveShares'){
@@ -1252,6 +1360,7 @@ document.addEventListener('input', e => {
   const t = e.target;
   if (t.dataset.share!==undefined){ previewShares('month'); return; }
   else if (t.dataset.defaultShare!==undefined){ previewShares('default'); return; }
+  else if (t.dataset.incomeSource!==undefined){const id=t.dataset.incomeSource;if(incomeSourcesFor(current).some(src=>src.id===id)){state.months[current][id]=num(t.value);save();if(tab==='dashboard')refreshComputed();}return;}
   else if (t.dataset.employeeName!==undefined){
     const i = Number(t.dataset.employeeName);
     const item = state.months[current].employees[i];
