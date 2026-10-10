@@ -73,6 +73,9 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:#202f48}
 .expense-line{display:flex;justify-content:space-between;gap:12px;font-size:13px;border-bottom:1px solid #2b3950;padding:8px 0}
 .expense-line span:first-child{color:#aab9d0}
 .danger{background:#422732;border-color:#754452}
+dialog.month-dialog{width:min(440px,calc(100vw - 28px));border:1px solid #344966;border-radius:18px;background:#162135;color:#e8edf6;padding:24px;box-shadow:0 24px 80px #0009}
+dialog.month-dialog::backdrop{background:#050a13bb;backdrop-filter:blur(3px)}
+.month-dialog h2{margin:0 0 8px}.month-dialog .hint{margin:0 0 18px}.month-dialog .field{margin:16px 0 20px}.month-dialog input{width:100%}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
 .saved{color:#6bdbad}.hidden{display:none!important}
 input[type=month],input[type=date]{color-scheme:dark}
 ::selection{background:#5878df}
@@ -179,6 +182,12 @@ input[type=month],input[type=date]{color-scheme:dark}
 <div id="content"></div>
 </main>
 </div>
+<dialog id="historicalMonthDialog" class="month-dialog" aria-labelledby="historicalMonthTitle">
+  <h2 id="historicalMonthTitle">Добавить прошлый месяц</h2>
+  <p class="hint">Выберите месяц до сентября 2026 года. Новый месяц будет пустым, чтобы не дублировать финансовые данные.</p>
+  <div class="field"><label for="historicalMonthValue">Месяц и год</label><input type="month" id="historicalMonthValue" max="2026-08" value="2026-08" required></div>
+  <div class="dialog-actions"><button class="btn" type="button" id="cancelHistoricalMonth">Отмена</button><button class="btn primary" type="button" id="createHistoricalMonth">Создать месяц</button></div>
+</dialog>
 <input type="file" id="importFile" accept=".json,application/json" hidden>
 <script>
 (()=>{'use strict';
@@ -195,6 +204,7 @@ const BACKUP_KEEP = 30;
 
 const KEY = 'business_finances_v1';
 const FIRST = '2026-09';
+const HISTORICAL_MAX = '2026-08';
 const AUTOSAVE_KEY = 'finance_autosave_settings_v1';
 const BACKUP_TS_KEY = 'finance_last_backup_ts';
 
@@ -294,8 +304,9 @@ state.settings.shares = validShares(state.settings.shares);
 for (const m of Object.values(state.months)) m.shares = validShares(m.shares);
 state.settings.schemaVersion = 5;
 
-let current = Object.keys(state.months).sort().at(-1) || FIRST;
-let tab = 'dashboard', range = 'year', start = FIRST, end = current;
+const knownMonths = Object.keys(state.months).filter(m=>/^\d{4}-(0[1-9]|1[0-2])$/.test(m)).sort();
+let current = knownMonths.at(-1) || FIRST;
+let tab = 'dashboard', range = 'year', start = knownMonths[0] || FIRST, end = current;
 
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -306,7 +317,7 @@ const pct = (n,d) => d ? ((n/d)*100).toFixed(1)+'%' : '0%';
 const fmt = m => new Date(m+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'long',year:'numeric'});
 const short = m => new Date(m+'-01T12:00:00').toLocaleDateString('ru-RU',{month:'short',year:'2-digit'});
 const add = (m,n=1) => { const [y,mm]=m.split('-').map(Number); return new Date(Date.UTC(y,mm-1+n,1)).toISOString().slice(0,7); };
-const monthList = () => Object.keys(state.months).filter(m=>m>=FIRST).sort();
+const monthList = () => Object.keys(state.months).filter(m=>/^\d{4}-(0[1-9]|1[0-2])$/.test(m)).sort();
 
 const moneyShare = n => new Intl.NumberFormat('ru-RU',{minimumFractionDigits:0,maximumFractionDigits:2}).format(Math.round((n+Number.EPSILON)*100)/100)+' ₸';
 const showPct = n => new Intl.NumberFormat('ru-RU',{maximumFractionDigits:2}).format(n)+'%';
@@ -697,6 +708,7 @@ function monthOptions(){
   return monthList().slice().reverse().map(m=>`<option value="${m}" ${current===m?'selected':''}>${fmt(m)}</option>`).join('');
 }
 function selector(){
+  const earliestMonth = monthList()[0] || FIRST;
   return `<select id="period" aria-label="Период">
     <option value="month" ${range==='month'?'selected':''}>Месяц</option>
     <option value="quarter" ${range==='quarter'?'selected':''}>Квартал</option>
@@ -705,7 +717,7 @@ function selector(){
     <option value="all" ${range==='all'?'selected':''}>Всё время</option>
     <option value="custom" ${range==='custom'?'selected':''}>Диапазон</option>
   </select>
-  ${range==='custom'?`<input type="month" id="start" min="${FIRST}" value="${start}"><input type="month" id="end" min="${FIRST}" value="${end}">`:''}`;
+  ${range==='custom'?`<input type="month" id="start" min="${earliestMonth}" value="${start}"><input type="month" id="end" min="${earliestMonth}" value="${end}">`:''}`;
 }
 
 function distributionPanel(ms, compact=false){
@@ -938,7 +950,7 @@ function monthEditor(){
   </select>`;
   return `<div class="section-head">
     <div><h2>Операции за ${fmt(current)}</h2><p class="hint">Изменения сохраняются автоматически.</p></div>
-    <div class="controls">${monthPicker}<span class="tag saved" id="status">Сохранено</span></div>
+    <div class="controls">${monthPicker}<button class="btn" type="button" id="addHistoricalMonth">+ Прошлый месяц</button><span class="tag saved" id="status">Сохранено</span></div>
   </div>
   <div class="kpis">
     ${kpi('Поступления', money(s.inc), 'Все каналы оплаты', '', 'inc')}
@@ -985,7 +997,7 @@ function monthEditor(){
 function monthsPage(){
   const ms = monthList().reverse();
   const incomeColumns = incomeSourceColumns(monthList());
-  return `<div class="section-head"><h2>Помесячные отчёты</h2><button class="btn primary" id="addMonths">+ Следующий месяц</button></div>
+  return `<div class="section-head"><h2>Помесячные отчёты</h2><div class="controls"><button class="btn" type="button" id="addHistoricalMonthFromMonths">+ Прошлый месяц</button><button class="btn primary" id="addMonths">+ Следующий месяц</button></div></div>
   <div class="card">
     <div class="table-wrap"><table>
       <thead><tr><th>Период</th>${incomeColumns.map(src=>`<th>${esc(src.name)}</th>`).join('')}<th>Доход</th><th>Расходы</th><th>Чистая прибыль</th><th>Жасталап</th><th>Асылхан</th><th>Дамир</th><th>Улучшение</th><th>Отчёт</th></tr></thead>
@@ -1180,6 +1192,67 @@ function render(){
   }
 }
 
+function openHistoricalMonthDialog(){
+  const dialog = $('#historicalMonthDialog');
+  const input = $('#historicalMonthValue');
+  if (!dialog || !input) return;
+  input.max = HISTORICAL_MAX;
+  input.value = HISTORICAL_MAX;
+  if (typeof dialog.showModal === 'function') dialog.showModal();
+  else alert('Ваш браузер не поддерживает окно добавления месяца. Откройте сайт в актуальной версии браузера.');
+  input.focus();
+}
+
+function createHistoricalMonth(){
+  const input = $('#historicalMonthValue');
+  const month = (input?.value || '').trim();
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)){
+    alert('Выберите месяц и год.');
+    input?.focus();
+    return;
+  }
+  if (month >= FIRST || month > HISTORICAL_MAX){
+    alert('Можно добавить месяц не позднее августа 2026 года. Для сентября 2026 года и последующих периодов используйте «Следующий месяц».');
+    input?.focus();
+    return;
+  }
+  const dialog = $('#historicalMonthDialog');
+  if (state.months[month]){
+    current = month;
+    tab = 'dashboard';
+    range = 'month';
+    if (dialog?.open) dialog.close();
+    render();
+    alert(`Месяц «${fmt(month)}» уже существует. Он открыт для редактирования.`);
+    window.scrollTo({top:0, behavior:'smooth'});
+    return;
+  }
+
+  const existing = monthList();
+  // Reuse only the list of income source names from the nearest month; all amounts start at zero.
+  const sourceMonth = existing.filter(m=>m < month).at(-1) || existing[0] || current;
+  const sources = incomeSourcesFor(sourceMonth).map(src=>({...src}));
+  state.months[month] = {
+    ...blank(),
+    incomeSources: sources,
+    ...Object.fromEntries(sources.map(src=>[src.id,0])),
+    shares: validShares(state.settings.shares),
+    employees: [],
+    custom: []
+  };
+  syncPayroll(month);
+  current = month;
+  tab = 'dashboard';
+  range = 'month';
+  const updatedMonths = monthList();
+  start = updatedMonths[0] || month;
+  end = updatedMonths.at(-1) || month;
+  if (dialog?.open) dialog.close();
+  save();
+  render();
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
 function makeNext(){
   const last = monthList().at(-1) || FIRST;
   const next = add(last);
@@ -1293,6 +1366,9 @@ document.addEventListener('click', async e => {
   else if (b.dataset.employeeOpen){ current = b.dataset.employeeOpen; tab='employees'; render(); window.scrollTo(0,0); }
   else if (b.dataset.open){ current = b.dataset.open; tab='dashboard'; range='month'; render(); window.scrollTo(0,0); }
   else if (b.id==='newMonth' || b.id==='addMonths') makeNext();
+  else if (b.id==='addHistoricalMonth' || b.id==='addHistoricalMonthFromMonths') openHistoricalMonthDialog();
+  else if (b.id==='cancelHistoricalMonth'){ $('#historicalMonthDialog')?.close(); }
+  else if (b.id==='createHistoricalMonth') createHistoricalMonth();
   else if (b.id==='addEmployee' || b.id==='addEmployeeEmpty'){
     state.months[current].employees.push({id:'emp-'+Date.now()+'-'+state.months[current].employees.length, name:'Новый сотрудник', salary:0});
     syncPayroll(current); render();
